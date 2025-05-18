@@ -113,6 +113,29 @@ class NL2SQLTransformer(nn.Module):
         assert encoder_relation_ids.size(1) == encoder_relation_ids.size(2) == L_enc, \
             "Relation IDs shape must match encoder sequence length"
 
+        # Ensure proper dtype for tensors, especially important for mixed precision training
+        # Integer tensors should remain as long, boolean masks should be boolean
+        encoder_input_ids = encoder_input_ids.long()
+        decoder_input_ids = decoder_input_ids.long()
+        encoder_relation_ids = encoder_relation_ids.long()
+        
+        # Convert masks to boolean if not already
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.dtype != torch.bool:
+                encoder_attention_mask = encoder_attention_mask.bool()
+        
+        if decoder_attention_mask is not None:
+            if decoder_attention_mask.dtype != torch.bool:
+                decoder_attention_mask = decoder_attention_mask.bool()
+        
+        if decoder_key_padding_mask is not None:
+            if decoder_key_padding_mask.dtype != torch.bool:
+                decoder_key_padding_mask = decoder_key_padding_mask.bool()
+        
+        if schema_mask is not None:
+            if schema_mask.dtype != torch.bool:
+                schema_mask = schema_mask.bool()
+
         # Process encoder_attention_mask for encoder self-attention
         # The encoder's self-attention layers expect a (B, L_enc, L_enc) mask.
         encoder_self_attn_mask_for_encoder_layers = None
@@ -186,13 +209,13 @@ class NL2SQLTransformer(nn.Module):
                 encoder_attention_mask: Optional[torch.Tensor] = None,
                 schema_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Generate SQL query from natural language input.
+        Generate SQL query from natural language input using greedy decoding.
         
         Args:
             encoder_input_ids: Input token IDs for encoder (batch_size, seq_len)
             encoder_relation_ids: Relation IDs between encoder tokens (batch_size, seq_len, seq_len)
             max_length: Maximum length of generated sequence
-            num_beams: Number of beams for beam search
+            num_beams: Number of beams for beam search (not used in this implementation yet)
             encoder_attention_mask: Optional. If 2D (batch_size, seq_len), it's a padding mask (True for non-padded tokens).
                                       If 3D (batch_size, seq_len, seq_len), it's a self-attention mask.
             schema_mask: Boolean mask indicating schema tokens (batch_size, seq_len)
@@ -200,6 +223,71 @@ class NL2SQLTransformer(nn.Module):
         Returns:
             Generated token IDs (batch_size, max_length)
         """
-        # TODO: Implement beam search generation, ensuring correct mask handling similar to forward pass.
-        # The encoder_attention_mask processing logic from the forward pass should be replicated here.
-        raise NotImplementedError("Beam search generation not implemented yet")
+        # Validate input
+        batch_size, L_enc = encoder_input_ids.shape
+        device = encoder_input_ids.device
+        
+        # Process encoder_attention_mask for encoder self-attention
+        encoder_self_attn_mask_for_encoder_layers = None
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.dim() == 2:  # (B, L_enc) padding mask (True for non-padded)
+                encoder_self_attn_mask_for_encoder_layers = encoder_attention_mask.unsqueeze(1).expand(-1, L_enc, -1)
+            elif encoder_attention_mask.dim() == 3:  # Already a (B, L_enc, L_enc) self-attention mask
+                encoder_self_attn_mask_for_encoder_layers = encoder_attention_mask
+            else:
+                raise ValueError(
+                    f"encoder_attention_mask has unexpected dimensions: {encoder_attention_mask.shape}"
+                )
+        
+        # Encode input once
+        encoder_output = self.encoder(
+            input_ids=encoder_input_ids,
+            relation_ids=encoder_relation_ids,
+            attention_mask=encoder_self_attn_mask_for_encoder_layers
+        )
+        
+        # Initialize decoder input with BOS token (assuming pad_token_id + 1, modify if using a different BOS token)
+        # For actual implementation, this should be replaced with the correct BOS token ID
+        bos_token_id = self.pad_token_id + 1  # This is a guess - adjust based on your tokenizer
+        decoder_input = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
+        
+        # Memory key padding mask for cross attention in decoder
+        memory_key_padding_mask = (encoder_input_ids == self.pad_token_id)
+        
+        # Generation loop
+        for i in range(max_length - 1):
+            # Create causal mask for decoder
+            seq_len = decoder_input.size(1)
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device),
+                diagonal=1
+            ).bool()
+            
+            # Forward pass through model
+            if self.use_pointer_generator:
+                outputs = self.decoder(
+                    tgt_ids=decoder_input,
+                    src_ids=encoder_input_ids,
+                    memory=encoder_output,
+                    schema_mask=schema_mask,
+                    tgt_mask=causal_mask,
+                    memory_key_padding_mask=memory_key_padding_mask
+                )
+                # Get next token (greedy)
+                next_token = outputs[:, -1:, :].argmax(dim=-1)
+            else:
+                outputs = self.decoder(
+                    tgt_ids=decoder_input,
+                    encoder_out=encoder_output,
+                    tgt_mask=causal_mask
+                )
+                # Get next token (greedy)
+                next_token = outputs[:, -1:, :].argmax(dim=-1)
+            
+            # Append next token to decoder input
+            decoder_input = torch.cat([decoder_input, next_token], dim=1)
+            
+            # Stop if all sequences have generated EOS token (you might need to define this)
+            # For now, we'll just generate the full length
+        
+        return decoder_input

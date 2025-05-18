@@ -1,11 +1,29 @@
 import os
+import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 import yaml
 
+# Set up logging
+logger = logging.getLogger(__name__)
+
 @dataclass
 class NL2SQLConfig:
-    """Configuration for NL2SQL model and training."""
+    """
+    Configuration for NL2SQL model and training.
+    
+    Notes on mixed precision training:
+    - When using mixed precision (mixed_precision=True), be aware that this causes
+      some operations to use float16/bfloat16, which may lead to numeric instability.
+    - The implementation has safeguards to ensure tensors have correct types (long for IDs, bool for masks),
+      but custom code might need additional type checking.
+    - For large batch sizes or deep models, consider enabling gradient_checkpointing to save memory.
+    
+    Notes on schema-aware training:
+    - For pointer-generator to work correctly, schema_mask must be properly generated.
+    - The schema parser in relation_matrix.py expects a specific format for schema tokens.
+    - If schema parsing fails, the system will fall back to heuristic approaches, but quality may degrade.
+    """
     # Model architecture
     vocab_size: int
     d_model: int
@@ -48,13 +66,55 @@ class NL2SQLConfig:
     
     @classmethod
     def from_yaml(cls, yaml_path: str, phase: str = 'sft'):
-        """Load configuration from YAML file."""
+        """
+        Load configuration from YAML file.
+        
+        Args:
+            yaml_path: Path to YAML config file
+            phase: Training phase ('pretraining' or 'sft')
+            
+        Returns:
+            NL2SQLConfig instance
+            
+        Raises:
+            FileNotFoundError: If YAML file doesn't exist
+            ValueError: If phase is invalid or required fields are missing
+            KeyError: If required config sections are missing
+        """
+        # Validate phase
+        if phase not in ['pretraining', 'sft']:
+            raise ValueError(f"Invalid phase: {phase}. Must be 'pretraining' or 'sft'.")
+            
+        # Check file exists
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+            
         with open(yaml_path, 'r') as f:
-            config_dict = yaml.safe_load(f)
+            try:
+                config_dict = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                raise ValueError(f"Error parsing YAML file: {e}")
+            
+        # Validate config_dict has required sections
+        required_sections = ['model', 'tokenizer', phase, 'paths']
+        missing_sections = [s for s in required_sections if s not in config_dict]
+        if missing_sections:
+            raise KeyError(f"Missing required config sections: {missing_sections}")
             
         # Get phase-specific config
         phase_config = config_dict[phase]
         
+        # Check for required fields in phase config
+        required_phase_fields = [
+            'micro_batch_size', 'max_batch_size', 'learning_rate', 'weight_decay',
+            'warmup_steps', 'max_steps', 'gradient_accumulation', 'max_grad_norm',
+            'early_stopping_patience', 'save_steps', 'num_workers', 'mixed_precision',
+            'use_8bit_optimizer', 'bf16', 'gradient_checkpointing'
+        ]
+        missing_fields = [f for f in required_phase_fields if f not in phase_config]
+        if missing_fields:
+            raise KeyError(f"Missing required fields in {phase} config: {missing_fields}")
+            
         # Create config with model and tokenizer settings
         config = cls(
             # Model architecture
@@ -95,6 +155,37 @@ class NL2SQLConfig:
             phase_max_len=phase_config.get('max_len')  # May be None if the phase doesn't have a max_len
         )
         
+        # For pointer-generator in SFT, ensure schema tokens are provided
+        if phase == 'sft' and config.use_pointer_generator:
+            required_schema_tokens = ['SCHEMA_START', 'SCHEMA_END', 'PK_START', 'PK_END', 'FK_START', 'FK_END']
+            missing_tokens = [t for t in required_schema_tokens if t not in config.special_tokens]
+            if missing_tokens:
+                raise ValueError(
+                    f"Pointer-generator requires schema tokens, but missing: {missing_tokens}. "
+                    "Either provide these tokens or set use_pointer_generator=false."
+                )
+                
+        # Special check for d_model and n_heads compatibility
+        if config.d_model % config.n_heads != 0:
+            raise ValueError(
+                f"d_model ({config.d_model}) must be divisible by n_heads ({config.n_heads}). "
+                f"This error will cause dimension mismatch in multi-head attention."
+            )
+            
+        # Check mixed precision settings
+        if config.mixed_precision and config.use_bf16 and not torch_supports_bf16():
+            logger.warning(
+                "BF16 precision requested but your system may not support it. "
+                "Training may fail. Consider setting bf16=false if errors occur."
+            )
+            
+        # Ensure gradient_checkpointing and no_grad compatibility
+        if config.gradient_checkpointing and not torch_supports_checkpoint():
+            logger.warning(
+                "Gradient checkpointing enabled but torch.utils.checkpoint may not be available. "
+                "This could lead to errors during training."
+            )
+            
         return config
     
     def __post_init__(self):
@@ -108,6 +199,10 @@ class NL2SQLConfig:
         assert 0 <= self.dropout <= 1, "dropout must be between 0 and 1"
         assert self.max_len > 0, "max_len must be positive"
         assert isinstance(self.use_pointer_generator, bool), "use_pointer_generator must be a boolean"
+        
+        # Model geometry validation
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         
         # Phase-specific max_len validation if it exists
         if self.phase_max_len is not None:
@@ -144,6 +239,31 @@ class NL2SQLConfig:
             
         assert self.pad_token_id == 18, "pad_token_id must be 18 to match tokenizer"
         
+        # Additional validation warnings
+        if self.mixed_precision and self.use_bf16:
+            logger.info("Using mixed precision with BF16. Ensure your hardware supports BF16.")
+            
+        if self.max_len > 1024 and not self.gradient_checkpointing:
+            logger.warning(
+                f"Using large max_len ({self.max_len}) without gradient_checkpointing. "
+                "This may lead to OOM errors with large models."
+            )
+            
+        # Warn about very large batch sizes
+        effective_batch = self.batch_size * self.gradient_accumulation_steps
+        if effective_batch > 128:
+            logger.warning(
+                f"Very large effective batch size: {effective_batch}. "
+                "Consider gradient accumulation instead of large micro-batch size."
+            )
+            
+        # Warn if using pointer-generator without phase_max_len setting
+        if self.use_pointer_generator and self.phase_max_len is None:
+            logger.warning(
+                "Using pointer-generator without phase_max_len specified. "
+                "For better memory efficiency, consider setting phase_max_len."
+            )
+            
     def to_yaml(self, path: str):
         """Save configuration to YAML file."""
         config_dict = asdict(self)
@@ -157,4 +277,22 @@ class NL2SQLConfig:
         Returns:
             The phase-specific max_len if it exists, otherwise the model's max_len
         """
-        return self.phase_max_len if self.phase_max_len is not None else self.max_len 
+        return self.phase_max_len if self.phase_max_len is not None else self.max_len
+
+
+def torch_supports_bf16() -> bool:
+    """Check if torch supports bfloat16."""
+    try:
+        import torch
+        return hasattr(torch, 'bfloat16')
+    except ImportError:
+        return False
+
+
+def torch_supports_checkpoint() -> bool:
+    """Check if torch supports checkpointing."""
+    try:
+        import torch.utils.checkpoint
+        return True
+    except ImportError:
+        return False 

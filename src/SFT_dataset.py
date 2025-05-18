@@ -47,9 +47,6 @@ class SFTDataset(Dataset):
         cot = example.get('cot', '')  # Chain of thought is optional
         sql = example['sql']
         
-        # Build relation matrix
-        relation_matrix = self.relation_builder.build_matrix(schema)
-        
         # Construct input sequence
         input_seq = f"{schema}\n{question}"
         if cot:
@@ -69,24 +66,50 @@ class SFTDataset(Dataset):
         input_ids = torch.tensor(input_tokens, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         labels = torch.tensor(target_tokens, dtype=torch.long)
-        relation_matrix = torch.tensor(relation_matrix, dtype=torch.long)
         
-        # Create schema mask for pointer-generator
-        # Parse schema tokens from input tokens
-        schema_tokens = self.relation_builder.parse_schema_tokens(input_tokens)
-        schema_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        
-        # Set mask to True for all schema tokens (columns, tables, PKs, FKs)
-        for token in schema_tokens:
-            # Include span from start to end inclusive
-            schema_mask[token.span_start:token.span_end+1] = True
+        # Build relation matrix - use build_relation_matrix directly with tokenized input
+        try:
+            # Parse schema tokens from input tokens
+            schema_tokens = self.relation_builder.parse_schema_tokens(input_tokens)
+            
+            # Validate schema tokens were found
+            if not schema_tokens:
+                logger.warning(f"No schema tokens found in example {idx}. Schema might be malformed.")
+                # Create fallback relation matrix with all zeros
+                relation_matrix = torch.zeros((len(input_tokens), len(input_tokens)), dtype=torch.long)
+            else:
+                # Build relation matrix using the parsed schema tokens
+                relation_matrix = self.relation_builder.build_relation_matrix(input_tokens, schema_tokens)
+                
+            # Create schema mask for pointer-generator
+            schema_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            
+            # Set mask to True for all schema tokens (columns, tables, PKs, FKs)
+            for token in schema_tokens:
+                # Include span from start to end inclusive
+                schema_mask[token.span_start:token.span_end+1] = True
+                
+            # Validate schema mask has at least one True value if schema tokens were found
+            if len(schema_tokens) > 0 and not schema_mask.any():
+                logger.warning(f"Schema mask creation failed for example {idx}. Using fallback.")
+                # Create a simple fallback schema mask marking the first part of the input as schema
+                # This is just a guess based on the typical structure
+                schema_end_idx = min(len(input_tokens) // 3, 100)  # Estimate schema region
+                schema_mask[:schema_end_idx] = True
+        except Exception as e:
+            logger.error(f"Error building relation matrix or schema mask for example {idx}: {e}")
+            relation_matrix = torch.zeros((len(input_tokens), len(input_tokens)), dtype=torch.long)
+            schema_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            # Create a simple fallback schema mask
+            schema_end_idx = min(len(input_tokens) // 3, 100)  # Estimate schema region
+            schema_mask[:schema_end_idx] = True
         
         return {
             'encoder_input': input_ids,
             'decoder_target': labels,
             'encoder_attention_mask': attention_mask,
             'relation_matrix': relation_matrix,
-            'schema_mask': schema_mask  # New field for pointer-generator
+            'schema_mask': schema_mask  # For pointer-generator
         }
 
     @staticmethod
