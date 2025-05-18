@@ -343,7 +343,11 @@ def test_real_training(pretraining=True, sft=True):
             sp_model_path=str(project_root / "models" / "nl2sql_tok.model"),
             output_dir=str(project_root / "outputs" / f"test_{mode}"),
             # Phase-specific max_len for pretraining (shorter sequences for testing)
-            phase_max_len=128 if mode == 'pretraining' else None
+            dataset_phase_max_len=128 if mode == 'pretraining' else None,
+            # For SFT, we need to add phase_max_len_pg for pointer-generator
+            # Use a value less than max_len (256) to avoid assertion error
+            phase_max_len_pg=200 if mode == 'sft' else None,
+            max_sql_len=50 if mode == 'sft' else None
         )
 
         # Set files based on mode

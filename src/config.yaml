@@ -75,6 +75,9 @@ sft:
   max_steps:                  206250    # 3 epochs × 2.2M / 32
   weight_decay:               0.01
   max_grad_norm:              1.0
+  # ---------- SFT specific length constraints ----------------------- #
+  phase_max_len:              1664      # Max length for schema + NL part (for pointer-generator)
+  max_sql_len:                320       # Expected max length for SQL part (for clarity/logging)
   # ---------- runtime ----------------------------------------------- #
   mixed_precision:            true
   bf16:                       true      # use BF16 on A100

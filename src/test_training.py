@@ -205,7 +205,7 @@ def test_training():
         sp_model_path=str(sp_model_dummy_path if sp_model_dummy_path.exists() and sp_model_dummy_path.stat().st_size > 0 else project_root / "models" / "nl2sql_tok.model"),
         output_dir=str(output_dir_test),
         # Add phase-specific max_len parameter for testing
-        phase_max_len=64  # Smaller than model.max_len (128) for testing
+        dataset_phase_max_len=64  # Smaller than model.max_len (128) for testing
     )
 
     # Set train_file and eval_file separately (not part of NL2SQLConfig)

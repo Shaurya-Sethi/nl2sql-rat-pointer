@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 import yaml
+import torch
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -69,7 +70,11 @@ class NL2SQLConfig:
     pad_token_id: int = 18
     
     # Phase-specific parameters
-    phase_max_len: Optional[int] = None  # Phase-specific max_len, defaults to model's max_len if not specified
+    # This phase_max_len is for the current phase's dataset item length (e.g. pretrain can use 512)
+    dataset_phase_max_len: Optional[int] = None 
+    # This phase_max_len_pg is specifically for SFT pointer-generator's source (schema+NL) part
+    phase_max_len_pg: Optional[int] = None 
+    max_sql_len: Optional[int] = None    # Expected max length for SQL part in SFT (for clarity/logging)
     
     @classmethod
     def from_yaml(cls, yaml_path: str, phase: str = 'sft'):
@@ -103,7 +108,7 @@ class NL2SQLConfig:
                 raise ValueError(f"Error parsing YAML file: {e}")
             
         # Validate config_dict has required sections
-        required_sections = ['model', 'tokenizer', phase, 'paths']
+        required_sections = ['model', 'tokenizer', phase, 'paths', 'logging']
         missing_sections = [s for s in required_sections if s not in config_dict]
         if missing_sections:
             raise KeyError(f"Missing required config sections: {missing_sections}")
@@ -166,8 +171,18 @@ class NL2SQLConfig:
             log_memory=config_dict['logging'].get('log_memory', True),
             
             # Phase-specific parameters
-            phase_max_len=phase_config.get('max_len')  # May be None if the phase doesn't have a max_len
+            # This phase_max_len is for the current phase's dataset item length (e.g. pretrain can use 512)
+            dataset_phase_max_len=phase_config.get('max_len'), 
+            # SFT specific lengths for PG and clarity
+            phase_max_len_pg=phase_config.get('phase_max_len') if phase == 'sft' else None,
+            max_sql_len=phase_config.get('max_sql_len') if phase == 'sft' else None,
         )
+        
+        # Overwrite phase_max_len with the SFT-specific one if in SFT phase and it exists
+        if phase == 'sft':
+            sft_phase_max_len = phase_config.get('phase_max_len') # The new one specific for schema+NL
+            if sft_phase_max_len is not None:
+                config.phase_max_len_pg = sft_phase_max_len
         
         # For pointer-generator in SFT, ensure schema tokens are provided
         if phase == 'sft' and config.use_pointer_generator:
@@ -200,6 +215,36 @@ class NL2SQLConfig:
                 "This could lead to errors during training."
             )
             
+        # Validate and log for pointer-generator and phase_max_len
+        if config.use_pointer_generator:
+            if config.phase_max_len_pg is None:
+                # If we are in a phase that should have it (e.g. SFT, but this check is general)
+                # For now, this error is specific to SFT as per user request.
+                # We determine current phase by checking if max_sql_len is set (proxy for SFT)
+                is_sft_like_phase = config.max_sql_len is not None 
+                if is_sft_like_phase: # Apply this stricter check for SFT-like phases
+                    raise ValueError(
+                        "Pointer-generator is enabled for SFT-like phase, but 'phase_max_len' is not set in config. "
+                        "This is required for schema+NL truncation."
+                    )
+                else: # For other phases (like pretraining, if PG was used there), it's a warning
+                    logger.warning(
+                        "Using pointer-generator without phase_max_len specified. "
+                        "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
+                    )
+            else:
+                logger.info(
+                    f"Pointer-generator enabled (phase_max_len={config.phase_max_len_pg}, max_sql_len={config.max_sql_len})"
+                )
+            
+        # Warn about very large batch sizes
+        effective_batch = config.batch_size * config.gradient_accumulation_steps
+        if effective_batch > 128:
+            logger.warning(
+                f"Very large effective batch size: {effective_batch}. "
+                "Consider gradient accumulation instead of large micro-batch size."
+            )
+            
         return config
     
     def __post_init__(self):
@@ -219,9 +264,17 @@ class NL2SQLConfig:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         
         # Phase-specific max_len validation if it exists
-        if self.phase_max_len is not None:
-            assert self.phase_max_len > 0, "phase_max_len must be positive"
-            assert self.phase_max_len <= self.max_len, "phase_max_len cannot exceed max_len"
+        if self.dataset_phase_max_len is not None:
+            assert self.dataset_phase_max_len > 0, "dataset_phase_max_len must be positive"
+            assert self.dataset_phase_max_len <= self.max_len, "dataset_phase_max_len cannot exceed max_len"
+        
+        if self.phase_max_len_pg is not None: # For SFT PG schema+NL part
+            assert self.phase_max_len_pg > 0, "phase_max_len_pg for SFT PG must be positive"
+            assert self.phase_max_len_pg <= self.max_len, \
+                f"phase_max_len_pg ({self.phase_max_len_pg}) cannot exceed model max_len ({self.max_len})"
+            if self.dataset_phase_max_len is not None : # e.g. if SFT had its own overall max_len like pretrain
+                 assert self.phase_max_len_pg <= self.dataset_phase_max_len, \
+                    f"phase_max_len_pg ({self.phase_max_len_pg}) cannot exceed dataset_phase_max_len ({self.dataset_phase_max_len})"
         
         # Training validation
         assert self.batch_size > 0, "batch_size must be positive"
@@ -271,12 +324,27 @@ class NL2SQLConfig:
                 "Consider gradient accumulation instead of large micro-batch size."
             )
             
-        # Warn if using pointer-generator without phase_max_len setting
-        if self.use_pointer_generator and self.phase_max_len is None:
-            logger.warning(
-                "Using pointer-generator without phase_max_len specified. "
-                "For better memory efficiency, consider setting phase_max_len."
-            )
+        # Validate and log for pointer-generator and phase_max_len
+        if self.use_pointer_generator:
+            if self.phase_max_len_pg is None:
+                # If we are in a phase that should have it (e.g. SFT, but this check is general)
+                # For now, this error is specific to SFT as per user request.
+                # We determine current phase by checking if max_sql_len is set (proxy for SFT)
+                is_sft_like_phase = self.max_sql_len is not None 
+                if is_sft_like_phase: # Apply this stricter check for SFT-like phases
+                    raise ValueError(
+                        "Pointer-generator is enabled for SFT-like phase, but 'phase_max_len' is not set in config. "
+                        "This is required for schema+NL truncation."
+                    )
+                else: # For other phases (like pretraining, if PG was used there), it's a warning
+                    logger.warning(
+                        "Using pointer-generator without phase_max_len specified. "
+                        "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
+                    )
+            else:
+                logger.info(
+                    f"Pointer-generator enabled (phase_max_len={self.phase_max_len_pg}, max_sql_len={self.max_sql_len})"
+                )
             
     def to_yaml(self, path: str):
         """Save configuration to YAML file."""
@@ -286,21 +354,20 @@ class NL2SQLConfig:
             
     def get_dataset_max_len(self) -> int:
         """
-        Get the appropriate max length for dataset truncation.
-        
-        Returns:
-            The phase-specific max_len if it exists, otherwise the model's max_len
+        Get the appropriate max length for truncating full dataset items for the current phase.
+        This uses dataset_phase_max_len if set (e.g. pretraining 512), otherwise model's global max_len.
         """
-        return self.phase_max_len if self.phase_max_len is not None else self.max_len
+        return self.dataset_phase_max_len if self.dataset_phase_max_len is not None else self.max_len
 
 
 def torch_supports_bf16() -> bool:
     """Check if torch supports bfloat16."""
     try:
-        import torch
-        return hasattr(torch, 'bfloat16')
-    except ImportError:
-        return False
+        return torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+    except AttributeError: # Older torch versions
+        try:
+            return hasattr(torch, 'bfloat16')
+        except ImportError: return False
 
 
 def torch_supports_checkpoint() -> bool:

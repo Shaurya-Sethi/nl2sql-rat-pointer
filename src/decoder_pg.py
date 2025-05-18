@@ -184,5 +184,10 @@ class PointerGeneratorDecoder(nn.Module):
 
         # ----- Final distribution combining generation and copying -----
         P_final = p_gen * P_vocab + (1.0 - p_gen) * P_copy_vocab
+        
+        # Ensure the final distribution sums to 1 across vocabulary dimension
+        # Add a small epsilon to prevent division by zero
+        P_final = P_final / (P_final.sum(dim=-1, keepdim=True) + 1e-12)
+        
         log_P_final = torch.log(P_final + 1e-9)
         return log_P_final 
