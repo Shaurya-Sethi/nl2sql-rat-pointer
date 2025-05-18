@@ -58,6 +58,13 @@ class NL2SQLConfig:
     sp_model_path: str
     output_dir: str
     
+    # TensorBoard logging
+    tensorboard_log_dir: Optional[str] = None  # Directory for TensorBoard logs, e.g., 'runs/exp1'
+    log_every_n_steps: int = 10  # Log training metrics every N steps
+    log_grad_norm: bool = True   # Whether to log gradient norms
+    log_grad_histogram: bool = False  # Whether to log parameter histograms (more expensive)
+    log_memory: bool = True  # Log GPU memory usage (if available)
+    
     # Parameters with default values
     pad_token_id: int = 18
     
@@ -150,6 +157,13 @@ class NL2SQLConfig:
             # Paths
             sp_model_path=config_dict['paths']['sp_model'],
             output_dir=config_dict['paths']['output_dir'],
+            
+            # TensorBoard logging
+            tensorboard_log_dir=config_dict['logging'].get('tensorboard_log_dir'),
+            log_every_n_steps=config_dict['logging'].get('log_every_n_steps', 10),
+            log_grad_norm=config_dict['logging'].get('log_grad_norm', True),
+            log_grad_histogram=config_dict['logging'].get('log_grad_histogram', False),
+            log_memory=config_dict['logging'].get('log_memory', True),
             
             # Phase-specific parameters
             phase_max_len=phase_config.get('max_len')  # May be None if the phase doesn't have a max_len

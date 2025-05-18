@@ -180,6 +180,12 @@ def main():
     final_model_dir.mkdir(parents=True, exist_ok=True)
     final_model_path = final_model_dir / 'final_model_state_dict.pt'
     torch.save(model.state_dict(), final_model_path)
+    
+    # Explicitly close the TensorBoard writer to ensure all logs are flushed
+    if hasattr(trainer, 'writer') and trainer.writer is not None:
+        logger.info("Closing TensorBoard writer...")
+        trainer._close_writer()
+        
     logger.info(f"Training complete. Final model state_dict saved to {final_model_path}")
 
 if __name__ == '__main__':
