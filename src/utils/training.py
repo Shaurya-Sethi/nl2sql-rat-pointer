@@ -220,6 +220,7 @@ class Trainer:
         skipped_batches = 0  # Track OOM or error skipped batches
         consecutive_oom = 0  # Count consecutive OOM errors
         max_consecutive_oom = 3  # Maximum consecutive OOM errors before reducing batch size
+        total_ooms_this_epoch = 0 # Initialize total OOMs for this epoch
         
         # Tracking metrics for TensorBoard
         batch_times = []
@@ -506,51 +507,74 @@ class Trainer:
                 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    # Empty CUDA cache
-                    if hasattr(torch.cuda, 'empty_cache'):
+                    if torch.cuda.is_available() and hasattr(torch.cuda, 'empty_cache'):
                         torch.cuda.empty_cache()
-                        
-                    consecutive_oom += 1
-                    logger.error(f"GPU OOM in batch {batch_idx}. Consecutive OOMs: {consecutive_oom}")
-                    skipped_batches += 1
                     
-                    # Implement dynamic batch size reduction
+                    total_ooms_this_epoch += 1
+                    skipped_batches += 1 
+                    consecutive_oom += 1
+
+                    logger.error(
+                        f"GPU OOM in Epoch {self.epoch}, Batch {batch_idx} (Global Step: {self.global_step}). "
+                        f"Current Batch Size: {current_batch_size}. Consecutive OOMs for this batch size: {consecutive_oom}. "
+                        f"Total OOMs this epoch: {total_ooms_this_epoch}. Error: {str(e)}"
+                    )
+
+                    if current_batch_size == 1:
+                        logger.critical(
+                            f"FATAL: GPU OOM with batch size 1 in Epoch {self.epoch}, Batch {batch_idx} (Global Step: {self.global_step}). "
+                            "Training cannot continue. Saving state and aborting."
+                        )
+                        self.save_checkpoint(is_best=False)
+                        if self.writer: # Log OOM count before closing writer
+                            self.writer.add_scalar('performance/epoch_total_ooms', total_ooms_this_epoch, self.epoch)
+                        self._close_writer()
+                        raise RuntimeError(
+                            f"Unrecoverable GPU OOM with batch size 1 at Epoch {self.epoch}, Global Step {self.global_step}. Training halted."
+                        )
+                    
+                    if total_ooms_this_epoch > 50 and total_ooms_this_epoch % 10 == 0:
+                         logger.warning(
+                            f"High OOM count in Epoch {self.epoch}: {total_ooms_this_epoch} OOMs. "
+                            f"Training stability potentially compromised. Current batch size: {current_batch_size}."
+                        )
+
                     if consecutive_oom >= max_consecutive_oom:
-                        # Reduce batch size by half (minimum 1)
                         new_batch_size = max(1, current_batch_size // 2)
-                        
-                        # Only adjust if we can make it smaller
                         if new_batch_size < current_batch_size:
                             logger.warning(
-                                f"Too many consecutive OOMs ({consecutive_oom}). "
-                                f"Reducing batch size from {current_batch_size} to {new_batch_size}"
+                                f"Reducing batch size due to {consecutive_oom} consecutive OOMs: {current_batch_size} -> {new_batch_size} "
+                                f"in Epoch {self.epoch}, Batch {batch_idx} (Global Step: {self.global_step})."
                             )
                             current_batch_size = new_batch_size
-                            consecutive_oom = 0  # Reset counter
-                            
-                            # Alert trainer if batch size is critically small
-                            if current_batch_size <= 2:
-                                logger.warning(
-                                    "Batch size reduced to critical level. "
-                                    "Consider reducing model size or input sequence length."
-                                )
-                        else:
-                            # If we can't reduce further, signal failure
+                            consecutive_oom = 0 # Reset for the new batch size
                             if current_batch_size == 1:
-                                logger.error(
-                                    "OOM with batch size of 1. Training cannot proceed. "
-                                    "Try reducing model size, gradient accumulation, or sequence length."
+                                logger.warning(
+                                     f"Batch size dynamically reduced to 1. Next OOM will be fatal. Epoch {self.epoch}, Global Step {self.global_step}."
                                 )
-                                break  # Exit the training loop
                     
-                    # Skip this batch and continue
-                    continue
-                else:
-                    raise e
+                    continue # Skip this batch
+                
+                else: # Handle other RuntimeErrors that are not OOM
+                    logger.error(
+                        f"Unhandled RuntimeError encountered in Epoch {self.epoch}, Batch {batch_idx} (Global Step: {self.global_step}). "
+                        f"Error: {str(e)}. Saving state and aborting training.",
+                        exc_info=True
+                    )
+                    self.save_checkpoint(is_best=False)
+                    self._close_writer()
+                    raise # Re-raise the original error to halt training
                     
-            except Exception as e:
-                logger.error(f"Error in batch {batch_idx}: {e}")
+            except Exception as e: # Catches other non-RuntimeErrors (e.g., from data loading, custom logic not covered by NaN checks)
+                                   # Note: ValueError from NaN loss check already saves/closes/raises.
+                logger.warning(
+                    f"Unhandled non-RuntimeError in Epoch {self.epoch}, Batch {batch_idx} (Global Step: {self.global_step}). "
+                    f"Skipping batch. Error: {str(e)}",
+                    exc_info=True
+                )
                 skipped_batches += 1
+                if self.optimizer: # Ensure grads are cleared if an error happened before optimizer step
+                    self.optimizer.zero_grad(set_to_none=True) 
                 continue
                 
         # Calculate average loss
@@ -575,6 +599,7 @@ class Trainer:
         if self.writer:
             self.writer.add_scalar('training/epoch_loss', avg_loss, self.epoch)
             self.writer.add_scalar('training/epoch_perplexity', torch.exp(torch.tensor(avg_loss)).item(), self.epoch)
+            self.writer.add_scalar('performance/epoch_total_ooms', total_ooms_this_epoch, self.epoch) # Log total OOMs for the epoch
             
             # Log additional metrics
             if batch_times:
