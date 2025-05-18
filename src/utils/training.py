@@ -80,6 +80,7 @@ class Trainer:
         self.global_step = 0
         self.epoch = 0
         self.no_improve_epochs = 0
+        self.current_loss = None  # Track the most recent average loss
         
     def train_epoch(self) -> Dict[str, float]:
         """
@@ -92,6 +93,7 @@ class Trainer:
         total_loss = 0
         total_tokens = 0
         num_batches = 0
+        step_losses = []  # Track individual step losses
         
         progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
         
@@ -164,13 +166,15 @@ class Trainer:
                     self.global_step += 1
                 
                 # Update metrics
-                total_loss += loss.item() * self.gradient_accumulation_steps
+                step_loss = loss.item() * self.gradient_accumulation_steps
+                step_losses.append(step_loss)
+                total_loss += step_loss
                 total_tokens += batch['encoder_attention_mask'].sum().item()
                 num_batches += 1
                 
                 # Update progress bar
                 progress_bar.set_postfix({
-                    'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}",
+                    'loss': f"{step_loss:.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
                 
@@ -189,6 +193,7 @@ class Trainer:
                 
         # Calculate average loss
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        self.current_loss = avg_loss  # Store the current loss
         return {'train_loss': avg_loss}
         
     def validate(self) -> Dict[str, float]:
@@ -205,6 +210,7 @@ class Trainer:
         total_loss = 0
         total_tokens = 0
         num_batches = 0
+        val_step_losses = []  # Track validation step losses
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self.val_dataloader, desc="Validation")):
@@ -246,7 +252,9 @@ class Trainer:
                         raise ValueError("Model output must contain either 'logits' or 'log_probs'")
                     
                     # Update metrics
-                    total_loss += loss.item()
+                    val_step_loss = loss.item()
+                    val_step_losses.append(val_step_loss)
+                    total_loss += val_step_loss
                     total_tokens += batch['encoder_attention_mask'].sum().item()
                     num_batches += 1
                     
@@ -265,6 +273,9 @@ class Trainer:
                     
         # Calculate average loss
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        # Update the current loss to validation loss as it's usually a better indicator
+        if avg_loss < float('inf'):
+            self.current_loss = avg_loss
         return {'val_loss': avg_loss}
         
     def save_checkpoint(self, is_best: bool = False):

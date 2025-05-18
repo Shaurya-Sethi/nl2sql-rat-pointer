@@ -7,13 +7,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
-from bitsandbytes.optim import AdamW8bit
+from bitsandbytes.optim import AdamW8bit # type: ignore
 from config import NL2SQLConfig
 from model import NL2SQLTransformer
 from tokenizer import NL2SQLTokenizer
 from relation_matrix import RelationMatrixBuilder
 from utils.training import Trainer
-from utils.metrics import compute_metrics
+from utils.metrics import compute_metrics # This is a simple acc/loss, not full eval.
 from Pretraining_dataset import PretrainingDataset
 from SFT_dataset import SFTDataset
 
@@ -24,26 +24,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def load_config(config_path):
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
-
 def main():
     parser = argparse.ArgumentParser(description='Train NL2SQL model')
     parser.add_argument('--phase', type=str, required=True, choices=['pretrain', 'sft'],
                       help='Training phase: pretrain or sft')
     parser.add_argument('--config', type=str, required=True,
-                      help='Path to config file')
+                      help='Path to config file (e.g., src/config.yaml)')
     parser.add_argument('--pretrained_model', type=str,
-                      help='Path to pretrained model for SFT phase')
+                      help='Path to pretrained model for SFT phase (load from checkpoint)')
     parser.add_argument('--seed', type=int, default=42,
                       help='Random seed')
-    parser.add_argument('--use_8bit_optimizer', action='store_true',
-                      help='Use 8-bit optimizer')
-    parser.add_argument('--use_cosine_schedule', action='store_true',
-                      help='Use cosine learning rate schedule')
     args = parser.parse_args()
 
     # Set random seed
@@ -51,124 +41,146 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Load config
-    config = load_config(args.config)
-    phase_config = config[args.phase]
+    # Load NL2SQLConfig object
+    try:
+        model_config = NL2SQLConfig.from_yaml(args.config, args.phase)
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at {args.config}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error loading or parsing configuration: {e}")
+        sys.exit(1)
+
+    # Handle pointer_generator for pretraining phase
+    if args.phase == 'pretrain' and model_config.use_pointer_generator:
+        logger.warning(
+            "Pointer-generator is enabled in config but current phase is 'pretrain'. "
+            "PretrainingDataset does not support schema_mask required by pointer-generator. "
+            "Forcing use_pointer_generator to False for pretraining."
+        )
+        model_config.use_pointer_generator = False
 
     # Initialize tokenizer
-    tokenizer = NL2SQLTokenizer(config['paths']['sp_model'])
-    if not tokenizer.sp_model:
-        logger.error("Failed to load tokenizer model")
+    try:
+        tokenizer = NL2SQLTokenizer(model_config.sp_model_path, model_config.special_tokens)
+    except Exception as e:
+        logger.error(f"Failed to load tokenizer: {e}")
         sys.exit(1)
 
     # Initialize relation matrix builder
-    relation_builder = RelationMatrixBuilder(config['model']['num_relations'])
+    relation_builder = RelationMatrixBuilder(
+        sp_model_path=model_config.sp_model_path,
+        special_tokens=model_config.special_tokens,
+        num_relations=model_config.num_relations
+    )
 
     # Initialize model
     if args.phase == 'sft' and args.pretrained_model:
-        logger.info(f"Loading pretrained model from {args.pretrained_model}")
-        model = torch.load(args.pretrained_model)
+        logger.info(f"Loading pretrained model checkpoint from {args.pretrained_model} for SFT.")
+        model = NL2SQLTransformer(
+            vocab_size=model_config.vocab_size,
+            d_model=model_config.d_model,
+            n_heads=model_config.n_heads,
+            n_layers=model_config.n_layers,
+            num_relations=model_config.num_relations,
+            dropout=model_config.dropout,
+            max_len=model_config.max_len,
+            use_pointer_generator=model_config.use_pointer_generator,
+            pad_token_id=model_config.pad_token_id
+        )
     else:
         model = NL2SQLTransformer(
-            vocab_size=config['model']['vocab_size'],
-            d_model=config['model']['d_model'],
-            n_heads=config['model']['n_heads'],
-            n_layers=config['model']['n_layers'],
-            num_relations=config['model']['num_relations'],
-            dropout=config['model']['dropout'],
-            max_len=config['model']['max_len']
+            vocab_size=model_config.vocab_size,
+            d_model=model_config.d_model,
+            n_heads=model_config.n_heads,
+            n_layers=model_config.n_layers,
+            num_relations=model_config.num_relations,
+            dropout=model_config.dropout,
+            max_len=model_config.max_len,
+            use_pointer_generator=model_config.use_pointer_generator,
+            pad_token_id=model_config.pad_token_id
         )
 
-    # Move model to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
+    logger.info(f"Using device: {device}")
 
-    # Create datasets
+    # Get the appropriate max_len for dataset truncation
+    dataset_max_len = model_config.get_dataset_max_len()
+    logger.info(f"Using max_len {dataset_max_len} for dataset truncation (model's max_len: {model_config.max_len})")
+
     if args.phase == 'pretrain':
         train_dataset = PretrainingDataset(
-            phase_config['train_file'],
-            tokenizer,
-            max_len=config['model']['max_len']
+            data_file=model_config.train_file,
+            tokenizer=tokenizer,
+            max_len=dataset_max_len
         )
         eval_dataset = PretrainingDataset(
-            phase_config['eval_file'],
-            tokenizer,
-            max_len=config['model']['max_len']
+            data_file=model_config.eval_file,
+            tokenizer=tokenizer,
+            max_len=dataset_max_len
         )
+        collate_fn_to_use = lambda batch: PretrainingDataset.collate_fn(batch, pad_id=model_config.pad_token_id)
     else:  # sft
         train_dataset = SFTDataset(
-            phase_config['train_file'],
-            tokenizer,
-            relation_builder,
-            max_len=config['model']['max_len']
+            data_file=model_config.train_file,
+            tokenizer=tokenizer,
+            relation_builder=relation_builder,
+            max_len=dataset_max_len,
+            pad_token_id=model_config.pad_token_id
         )
         eval_dataset = SFTDataset(
-            phase_config['eval_file'],
-            tokenizer,
-            relation_builder,
-            max_len=config['model']['max_len']
+            data_file=model_config.eval_file,
+            tokenizer=tokenizer,
+            relation_builder=relation_builder,
+            max_len=dataset_max_len,
+            pad_token_id=model_config.pad_token_id
         )
+        collate_fn_to_use = lambda batch: SFTDataset.collate_fn(batch, pad_id=model_config.pad_token_id)
 
-    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=phase_config['micro_batch_size'],
+        batch_size=model_config.batch_size,
         shuffle=True,
-        num_workers=phase_config['num_workers']
+        num_workers=model_config.num_workers,
+        collate_fn=collate_fn_to_use
     )
     eval_loader = DataLoader(
         eval_dataset,
-        batch_size=phase_config['micro_batch_size'],
+        batch_size=model_config.batch_size,
         shuffle=False,
-        num_workers=phase_config['num_workers']
+        num_workers=model_config.num_workers,
+        collate_fn=collate_fn_to_use
     )
 
-    # Create optimizer
-    if args.use_8bit_optimizer:
-        optimizer = AdamW8bit(
-            model.parameters(),
-            lr=phase_config['learning_rate'],
-            weight_decay=phase_config['weight_decay']
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=phase_config['learning_rate'],
-            weight_decay=phase_config['weight_decay']
-        )
-
-    # Create learning rate scheduler
-    if args.use_cosine_schedule:
-        total_steps = len(train_loader) * phase_config['epochs']
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=phase_config['warmup_steps'],
-            num_training_steps=total_steps
-        )
-    else:
-        scheduler = None
-
-    # Create trainer
     trainer = Trainer(
         model=model,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        config=model_config,
+        train_dataloader=train_loader,
+        val_dataloader=eval_loader,
         device=device,
-        config=phase_config,
-        compute_metrics=compute_metrics
     )
 
-    # Train model
-    logger.info(f"Starting {args.phase} training...")
-    trainer.train()
+    if args.phase == 'sft' and args.pretrained_model:
+        try:
+            trainer.load_checkpoint(args.pretrained_model)
+            logger.info(f"Successfully loaded weights from checkpoint: {args.pretrained_model}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint {args.pretrained_model}: {e}. Starting SFT from scratch.")
 
-    # Save final model
-    output_dir = Path(config['paths']['output_dir']) / args.phase
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model, output_dir / 'final_model.pt')
-    logger.info(f"Training complete. Model saved to {output_dir / 'final_model.pt'}")
+    logger.info(f"Starting {args.phase} training for {model_config.max_steps} steps...")
+    steps_per_epoch = len(train_loader) // model_config.gradient_accumulation_steps
+    if steps_per_epoch == 0 : steps_per_epoch = 1 # Avoid division by zero for tiny datasets
+    num_epochs_for_max_steps = (model_config.max_steps + steps_per_epoch -1) // steps_per_epoch 
+
+    logger.info(f"Calculated num_epochs based on max_steps: {num_epochs_for_max_steps}")
+    trainer.train(num_epochs=num_epochs_for_max_steps)
+
+    final_model_dir = Path(model_config.output_dir) / args.phase
+    final_model_dir.mkdir(parents=True, exist_ok=True)
+    final_model_path = final_model_dir / 'final_model_state_dict.pt'
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"Training complete. Final model state_dict saved to {final_model_path}")
 
 if __name__ == '__main__':
     main() 

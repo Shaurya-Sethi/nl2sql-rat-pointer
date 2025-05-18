@@ -77,7 +77,7 @@ class NL2SQLTransformer(nn.Module):
 
     def forward(self, encoder_input_ids: torch.Tensor, decoder_input_ids: torch.Tensor,
                 encoder_relation_ids: torch.Tensor,
-                encoder_attention_mask: Optional[torch.Tensor] = None,
+                encoder_attention_mask: Optional[torch.Tensor] = None, # Can be (B,L) padding mask or (B,L,L) attention mask
                 decoder_attention_mask: Optional[torch.Tensor] = None,
                 decoder_key_padding_mask: Optional[torch.Tensor] = None,
                 schema_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
@@ -88,7 +88,8 @@ class NL2SQLTransformer(nn.Module):
             encoder_input_ids: Input token IDs for encoder (batch_size, seq_len)
             decoder_input_ids: Input token IDs for decoder (batch_size, seq_len)
             encoder_relation_ids: Relation IDs between encoder tokens (batch_size, seq_len, seq_len)
-            encoder_attention_mask: Attention mask for encoder (batch_size, seq_len, seq_len)
+            encoder_attention_mask: Optional. If 2D (batch_size, seq_len), it's a padding mask (True for non-padded tokens).
+                                      If 3D (batch_size, seq_len, seq_len), it's a self-attention mask.
             decoder_attention_mask: Attention mask for decoder (batch_size, seq_len, seq_len)
             decoder_key_padding_mask: Key padding mask for decoder (batch_size, seq_len)
             schema_mask: Boolean mask indicating schema tokens (batch_size, seq_len)
@@ -104,25 +105,44 @@ class NL2SQLTransformer(nn.Module):
                     - encoder_output: Encoder output (batch_size, seq_len, d_model)
         """
         # Validate input shapes
-        batch_size = encoder_input_ids.size(0)
+        batch_size, L_enc = encoder_input_ids.shape
         assert encoder_input_ids.size(0) == decoder_input_ids.size(0), \
             "Batch sizes must match between encoder and decoder inputs"
         assert encoder_relation_ids.size(0) == batch_size, \
             "Batch size must match for relation IDs"
-        assert encoder_relation_ids.size(1) == encoder_relation_ids.size(2) == encoder_input_ids.size(1), \
+        assert encoder_relation_ids.size(1) == encoder_relation_ids.size(2) == L_enc, \
             "Relation IDs shape must match encoder sequence length"
+
+        # Process encoder_attention_mask for encoder self-attention
+        # The encoder's self-attention layers expect a (B, L_enc, L_enc) mask.
+        encoder_self_attn_mask_for_encoder_layers = None
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.dim() == 2:  # (B, L_enc) padding mask (True for non-padded)
+                # Expand padding mask to be (B, L_enc, L_enc) for self-attention.
+                # This allows a query token i to attend to key token j if key token j is not padded.
+                encoder_self_attn_mask_for_encoder_layers = encoder_attention_mask.unsqueeze(1).expand(-1, L_enc, -1)
+            elif encoder_attention_mask.dim() == 3:  # Already a (B, L_enc, L_enc) self-attention mask
+                encoder_self_attn_mask_for_encoder_layers = encoder_attention_mask
+            else:
+                raise ValueError(
+                    f"encoder_attention_mask has unexpected dimensions: {encoder_attention_mask.shape}"
+                )
             
         # Encode input
         encoder_output = self.encoder(
             input_ids=encoder_input_ids,
             relation_ids=encoder_relation_ids,
-            attention_mask=encoder_attention_mask
+            attention_mask=encoder_self_attn_mask_for_encoder_layers # Pass the (B, L_enc, L_enc) mask
         )
         
-        # Create key padding mask if not provided (for transformer attention)
+        # Create key padding mask for decoder if not provided (True for padded tokens)
         if decoder_key_padding_mask is None:
             decoder_key_padding_mask = (decoder_input_ids == self.pad_token_id)
         
+        # Determine memory_key_padding_mask for decoder's cross-attention (True for padded encoder tokens)
+        # This uses the original encoder_input_ids to identify padding.
+        actual_memory_key_padding_mask = (encoder_input_ids == self.pad_token_id)
+
         # Decode with appropriate decoder
         if self.use_pointer_generator:
             # Ensure schema mask is provided for pointer-generator
@@ -134,9 +154,9 @@ class NL2SQLTransformer(nn.Module):
                 src_ids=encoder_input_ids,
                 memory=encoder_output,
                 schema_mask=schema_mask,
-                tgt_mask=decoder_attention_mask,
-                tgt_key_padding_mask=decoder_key_padding_mask,
-                memory_key_padding_mask=(encoder_input_ids == self.pad_token_id)
+                tgt_mask=decoder_attention_mask, # This is the causal mask for decoder self-attention
+                tgt_key_padding_mask=decoder_key_padding_mask, # Padding for target sequence
+                memory_key_padding_mask=actual_memory_key_padding_mask # Padding for encoder sequence in cross-attention
             )
             
             return {
@@ -150,6 +170,10 @@ class NL2SQLTransformer(nn.Module):
                 encoder_out=encoder_output,
                 tgt_mask=decoder_attention_mask,
                 tgt_key_padding_mask=decoder_key_padding_mask
+                # Standard TransformerDecoder takes memory_key_padding_mask in its forward, 
+                # but our current one doesn't explicitly. It might be implicitly handled or expected via memory_mask.
+                # For safety, if using the standard decoder, ensure it handles encoder padding if necessary.
+                # The original TransformerDecoder used in this codebase does accept memory_key_padding_mask.
             )
             
             return {
@@ -169,11 +193,13 @@ class NL2SQLTransformer(nn.Module):
             encoder_relation_ids: Relation IDs between encoder tokens (batch_size, seq_len, seq_len)
             max_length: Maximum length of generated sequence
             num_beams: Number of beams for beam search
-            encoder_attention_mask: Attention mask for encoder (batch_size, seq_len, seq_len)
+            encoder_attention_mask: Optional. If 2D (batch_size, seq_len), it's a padding mask (True for non-padded tokens).
+                                      If 3D (batch_size, seq_len, seq_len), it's a self-attention mask.
             schema_mask: Boolean mask indicating schema tokens (batch_size, seq_len)
             
         Returns:
             Generated token IDs (batch_size, max_length)
         """
-        # TODO: Implement beam search generation
+        # TODO: Implement beam search generation, ensuring correct mask handling similar to forward pass.
+        # The encoder_attention_mask processing logic from the forward pass should be replicated here.
         raise NotImplementedError("Beam search generation not implemented yet")

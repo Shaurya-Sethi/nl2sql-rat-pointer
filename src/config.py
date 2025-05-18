@@ -43,6 +43,9 @@ class NL2SQLConfig:
     # Parameters with default values
     pad_token_id: int = 18
     
+    # Phase-specific parameters
+    phase_max_len: Optional[int] = None  # Phase-specific max_len, defaults to model's max_len if not specified
+    
     @classmethod
     def from_yaml(cls, yaml_path: str, phase: str = 'sft'):
         """Load configuration from YAML file."""
@@ -86,7 +89,10 @@ class NL2SQLConfig:
             
             # Paths
             sp_model_path=config_dict['paths']['sp_model'],
-            output_dir=config_dict['paths']['output_dir']
+            output_dir=config_dict['paths']['output_dir'],
+            
+            # Phase-specific parameters
+            phase_max_len=phase_config.get('max_len')  # May be None if the phase doesn't have a max_len
         )
         
         return config
@@ -102,6 +108,11 @@ class NL2SQLConfig:
         assert 0 <= self.dropout <= 1, "dropout must be between 0 and 1"
         assert self.max_len > 0, "max_len must be positive"
         assert isinstance(self.use_pointer_generator, bool), "use_pointer_generator must be a boolean"
+        
+        # Phase-specific max_len validation if it exists
+        if self.phase_max_len is not None:
+            assert self.phase_max_len > 0, "phase_max_len must be positive"
+            assert self.phase_max_len <= self.max_len, "phase_max_len cannot exceed max_len"
         
         # Training validation
         assert self.batch_size > 0, "batch_size must be positive"
@@ -137,4 +148,13 @@ class NL2SQLConfig:
         """Save configuration to YAML file."""
         config_dict = asdict(self)
         with open(path, 'w') as f:
-            yaml.dump(config_dict, f, default_flow_style=False) 
+            yaml.dump(config_dict, f, default_flow_style=False)
+            
+    def get_dataset_max_len(self) -> int:
+        """
+        Get the appropriate max length for dataset truncation.
+        
+        Returns:
+            The phase-specific max_len if it exists, otherwise the model's max_len
+        """
+        return self.phase_max_len if self.phase_max_len is not None else self.max_len 

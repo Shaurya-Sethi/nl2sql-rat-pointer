@@ -112,7 +112,7 @@ def test_pointer_generator_in_model():
     assert 'encoder_output' in outputs
     
     # Check output shapes
-    assert outputs['log_probs'].shape == (batch_size, seq_len-1, vocab_size)
+    assert outputs['log_probs'].shape == (batch_size, seq_len, vocab_size)
     assert outputs['encoder_output'].shape == (batch_size, seq_len, d_model)
     
     # Convert log_probs to probabilities and check they sum to 1
