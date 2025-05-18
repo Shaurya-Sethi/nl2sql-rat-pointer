@@ -25,33 +25,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variable to hold trainer instance for signal handlers
+# Global variables for signal handling
 global_trainer = None
+training_interrupted = False  # Added global flag for signal handling
 
 # Signal handlers for graceful shutdown
 def handle_signal(signum, frame):
-    """Handle termination signals by saving checkpoint and exiting gracefully"""
+    """Handle termination signals by setting a flag for graceful shutdown"""
+    global training_interrupted
     sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-    logger.info(f"{sig_name} received, saving checkpoint and shutting down gracefully.")
+    logger.info(f"{sig_name} received, flagging for graceful shutdown.")
     
-    if global_trainer is not None:
-        try:
-            # Save checkpoint
-            global_trainer.save_checkpoint(is_best=False)
-            logger.info("Checkpoint saved successfully.")
-            
-            # Close TensorBoard writer
-            global_trainer._close_writer()
-            logger.info("TensorBoard writer closed.")
-        except Exception as e:
-            logger.error(f"Error during graceful shutdown: {e}")
-    else:
-        logger.warning(f"{sig_name} received but trainer not initialized yet. Exiting without saving.")
-    
-    # Exit with success status
-    sys.exit(0)
+    # Set the flag instead of directly calling non-thread-safe operations
+    training_interrupted = True
 
 def main():
+    global global_trainer, training_interrupted  # Add the global flag to main scope
+    
     parser = argparse.ArgumentParser(description='Train NL2SQL model')
     parser.add_argument('--phase', type=str, required=True, choices=['pretrain', 'sft'],
                       help='Training phase: pretrain or sft')
@@ -209,7 +199,56 @@ def main():
     num_epochs_for_max_steps = (model_config.max_steps + steps_per_epoch -1) // steps_per_epoch 
 
     logger.info(f"Calculated num_epochs based on max_steps: {num_epochs_for_max_steps}")
-    trainer.train(num_epochs=num_epochs_for_max_steps)
+    
+    # Modified training loop to check for interrupt flag
+    for epoch in range(num_epochs_for_max_steps):
+        trainer.epoch = epoch
+        
+        # Train epoch
+        train_metrics = trainer.train_epoch()
+        logger.info(f"Epoch {epoch} - Train Loss: {train_metrics['train_loss']:.4f}")
+        
+        # Check if we received an interrupt signal
+        if training_interrupted:
+            logger.info("Training was interrupted. Saving checkpoint and exiting gracefully...")
+            trainer.save_checkpoint(is_best=False)
+            trainer._close_writer()
+            logger.info("Checkpoint saved and TensorBoard writer closed. Exiting.")
+            sys.exit(0)
+        
+        # Validate
+        if trainer.val_dataloader is not None:
+            val_metrics = trainer.validate()
+            logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_loss']:.4f}")
+            
+            # Early stopping check - ensure loss is finite
+            val_loss = val_metrics['val_loss']
+            if torch.isfinite(torch.tensor(val_loss)) and val_loss < trainer.best_val_loss:
+                trainer.best_val_loss = val_loss
+                trainer.save_checkpoint(is_best=True)
+                trainer.no_improve_epochs = 0
+            else:
+                trainer.no_improve_epochs += 1
+                if trainer.no_improve_epochs >= trainer.early_stopping_patience:
+                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                    break
+        
+        # Check again for interrupt signals after validation
+        if training_interrupted:
+            logger.info("Training was interrupted. Saving checkpoint and exiting gracefully...")
+            trainer.save_checkpoint(is_best=False)
+            trainer._close_writer()
+            logger.info("Checkpoint saved and TensorBoard writer closed. Exiting.")
+            sys.exit(0)
+            
+        # Save regular checkpoint
+        if (epoch + 1) % model_config.save_steps == 0:
+            trainer.save_checkpoint()
+        
+        # Clear CUDA cache to reduce memory fragmentation
+        if torch.cuda.is_available():
+            logger.info("Clearing CUDA cache to reduce memory fragmentation")
+            torch.cuda.empty_cache()
 
     final_model_dir = Path(model_config.output_dir) / args.phase
     final_model_dir.mkdir(parents=True, exist_ok=True)

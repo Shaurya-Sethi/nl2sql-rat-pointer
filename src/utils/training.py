@@ -1034,35 +1034,56 @@ class Trainer:
                     'pad_token_id': self.config.pad_token_id
                 }
                 
-                # Check for critical mismatches
-                critical_mismatch = False
-                mismatch_fields = []
+                # Define critical parameters that must match exactly
+                critical_params = [
+                    'vocab_size',          # Must match for embedding layers and vocab projections
+                    'use_pointer_generator', # Different decoder architectures
+                    'd_model',             # Size of hidden representations
+                    'n_layers',            # Number of layers in model 
+                    'n_heads',             # Number of attention heads
+                    'num_relations'        # Relation types for schema encoding
+                ]
                 
-                for key in ['vocab_size', 'd_model', 'n_heads', 'n_layers', 'use_pointer_generator']:
-                    if key in stored_config and stored_config.get(key) != current_config.get(key):
-                        mismatch_fields.append(key)
-                        if key in ['vocab_size', 'd_model', 'use_pointer_generator']:
-                            critical_mismatch = True
+                # Check for mismatches in critical parameters
+                critical_mismatches = []
+                for param in critical_params:
+                    if stored_config.get(param) != current_config.get(param):
+                        critical_mismatches.append(
+                            f"{param}: checkpoint={stored_config.get(param)}, current={current_config.get(param)}"
+                        )
                 
-                if mismatch_fields:
-                    mismatch_msg = f"Checkpoint configuration mismatch in fields: {', '.join(mismatch_fields)}"
-                    logger.warning(mismatch_msg)
+                # If any critical parameters don't match, raise a ValueError
+                if critical_mismatches:
+                    error_msg = (
+                        f"Critical model configuration mismatch when loading checkpoint from {checkpoint_path}.\n"
+                        f"The following parameters are incompatible:\n"
+                        f"{chr(10).join(critical_mismatches)}\n"
+                        f"Cannot safely load checkpoint with different architecture parameters."
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
                     
-                    if critical_mismatch:
-                        raise ValueError(
-                            f"Critical model configuration mismatch: {mismatch_msg}. "
-                            "Cannot safely load checkpoint with different architecture. "
-                            "Use a compatible model configuration or train from scratch."
+                # Check for other non-critical parameters 
+                non_critical_params = [param for param in stored_config if param not in critical_params]
+                non_critical_mismatches = []
+                for param in non_critical_params:
+                    if param in current_config and stored_config.get(param) != current_config.get(param):
+                        non_critical_mismatches.append(
+                            f"{param}: checkpoint={stored_config.get(param)}, current={current_config.get(param)}"
                         )
-                    else:
-                        logger.warning(
-                            "Non-critical configuration differences detected. "
-                            "Continuing with checkpoint loading, but model behavior may be affected."
-                        )
+                
+                # Warn about non-critical differences
+                if non_critical_mismatches:
+                    logger.warning(
+                        f"Non-critical configuration differences detected:\n"
+                        f"{chr(10).join(non_critical_mismatches)}\n"
+                        f"Continuing with checkpoint loading, but model behavior may be affected."
+                    )
             else:
                 logger.warning(
                     "Checkpoint does not contain model configuration. "
-                    "This may be an older checkpoint format. Loading without verification."
+                    "This may be an older checkpoint format. Cannot validate architecture compatibility. "
+                    "Proceed with caution as loading may fail or produce unexpected results."
                 )
             
             self.model.load_state_dict(checkpoint['model_state_dict'])
