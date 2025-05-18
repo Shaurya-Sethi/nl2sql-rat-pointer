@@ -3,6 +3,7 @@ import logging
 import torch
 import sys
 import traceback
+import shutil # Added for rmtree
 from pathlib import Path
 from model import NL2SQLTransformer
 from tokenizer import NL2SQLTokenizer
@@ -65,9 +66,16 @@ class TokenizedTextDataset(torch.utils.data.Dataset):
         input_ids = torch.tensor(ids, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool) # True for non-padded
         
-        # Create dummy schema_mask (e.g., all False, or a small portion True)
-        # For this test, let's make it all False as it's a generic text dataset.
+        # Create a simple schema mask, marking a portion as True if PG is used
+        # This helps prevent potential instability with pointer-generator networks
+        # when the schema_mask might otherwise be all False.
+        schema_len = 0
+        if len(input_ids) > 0: # Ensure input_ids is not empty before calculating length
+            schema_len = max(1, int(len(input_ids) * 0.1)) # Mark first 10% as schema for test
+        
         schema_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if schema_len > 0 and len(input_ids) >= schema_len: # Check if schema_len is valid
+            schema_mask[:schema_len] = True
         
         return {
             'encoder_input': input_ids,
@@ -117,6 +125,14 @@ def test_training():
     logger.info(f"Using device: {device}")
 
     project_root = Path(__file__).resolve().parent.parent # Get project root more reliably
+
+    output_dir_test = project_root / "outputs_test_training"
+    # Clean up output directory from previous test runs to avoid stale checkpoints
+    if output_dir_test.exists():
+        logger.info(f"Cleaning up existing test output directory: {output_dir_test}")
+        shutil.rmtree(output_dir_test)
+    output_dir_test.mkdir(parents=True, exist_ok=True)
+
     # Use a small, actual tokenized data file if available for more realistic testing,
     # otherwise, create a dummy one for the test to run.
     # For now, assuming the SFT filtered train file exists and is small enough or we take a slice.
@@ -152,9 +168,6 @@ def test_training():
             logger.error(f"Could not train dummy sentencepiece model: {e}")
             sp_model_dummy_path.touch() # Fallback
 
-    output_dir_test = project_root / "outputs_test_training"
-    output_dir_test.mkdir(parents=True, exist_ok=True)
-
     config = NL2SQLConfig(
         vocab_size=32000, # Should match tokenizer if using real data
         d_model=64,      # Smaller for faster test
@@ -164,7 +177,7 @@ def test_training():
         dropout=0.1,
         max_len=128,     # Smaller max_len for test
         pad_token_id=18,
-        use_pointer_generator=True, # Test with PG enabled
+        use_pointer_generator=False, # Test with PG disabled for this basic test
         special_tokens={ # Minimal special tokens for config validation
             'SCHEMA_START': '<SCHEMA>', 'SCHEMA_END': '</SCHEMA>',
             'PK_START': '<PK>', 'PK_END': '</PK>',

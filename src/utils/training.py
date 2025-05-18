@@ -322,9 +322,10 @@ class Trainer:
                     
                     # Check for NaN/Inf in loss
                     if not torch.isfinite(loss).all():
-                        logger.error(f"Non-finite loss detected: {loss.item()} in batch {batch_idx}, skipping")
-                        skipped_batches += 1
-                        continue
+                        logger.error(f"Non-finite loss detected: {loss.item()} in batch {batch_idx} at global step {self.global_step}. Halting training.")
+                        self.save_checkpoint()
+                        self._close_writer()
+                        raise ValueError(f"Non-finite loss encountered in batch {batch_idx} at global step {self.global_step}. Training halted.")
                     
                     # Scale loss for gradient accumulation
                     loss = loss / self.gradient_accumulation_steps
@@ -335,24 +336,16 @@ class Trainer:
                 else:
                     loss.backward()
                 
-                # Reset consecutive OOM counter since we got past the backward pass
-                consecutive_oom = 0
-                
-                # Check for NaN/Inf in gradients
-                has_nan_or_inf_grad = False
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None:
-                        if not torch.isfinite(param.grad).all():
-                            logger.error(f"Non-finite gradient detected in {name}, skipping batch {batch_idx}")
-                            has_nan_or_inf_grad = True
-                            break
-                
-                if has_nan_or_inf_grad:
-                    # Skip this batch due to bad gradients
+                # Check for NaN/Inf in gradients using the helper method
+                if self._has_nan_or_inf_grad(): # _has_nan_or_inf_grad logs specific parameter and global_step
+                    logger.error(f"Skipping batch {batch_idx} at global step {self.global_step} due to non-finite gradients.")
                     skipped_batches += 1
-                    if self.optimizer:
+                    if self.optimizer: # Ensure optimizer exists
                         self.optimizer.zero_grad()
                     continue
+                
+                # Reset consecutive OOM counter since we got past the backward pass
+                consecutive_oom = 0
                 
                 # Calculate gradient norm for logging
                 if self.writer and self.config.log_grad_norm and (batch_idx + 1) % self.gradient_accumulation_steps == 0:
@@ -910,7 +903,16 @@ class Trainer:
         }
         
         return metrics
-        
+
+    def _has_nan_or_inf_grad(self):
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                if not torch.isfinite(param.grad).all():
+                    logger.error(f"Non-finite gradient detected in {name} at step {self.global_step}.")
+                    return True
+        return False
+
+
     def save_checkpoint(self, is_best: bool = False):
         """
         Save model checkpoint.
