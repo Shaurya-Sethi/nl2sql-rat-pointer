@@ -1112,19 +1112,21 @@ class Trainer:
                 if (epoch + 1) % self.config.save_steps == 0:
                     self.save_checkpoint()
                     
-            # Close TensorBoard writer at the end of successful training
-            self._close_writer()
+            # TensorBoard writer is now closed in the finally block
                     
         except KeyboardInterrupt:
             logger.info("Training interrupted by user")
             self.save_checkpoint()
-            self._close_writer()
+            # TensorBoard writer is now closed in the finally block
             
         except Exception as e:
-            logger.error(f"Error during training: {e}")
+            logger.error(f"Error during training: {e}", exc_info=True) # Added exc_info for better debugging
             self.save_checkpoint()
-            self._close_writer()
+            # TensorBoard writer is now closed in the finally block
             raise
+        finally:
+            # Ensure TensorBoard writer is always closed
+            self._close_writer()
             
     def _close_writer(self):
         """Close TensorBoard writer to ensure all logs are flushed."""

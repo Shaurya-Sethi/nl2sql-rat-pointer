@@ -497,11 +497,11 @@ def test_real_training(pretraining=True, sft=True):
         logger.info(f"  Samples processed: {samples_processed}")
         logger.info(f"  Throughput: {throughput:.2f} samples/second")
         try:
-            # Some trainer implementations might not have current_loss attribute
-            loss_value = getattr(trainer, 'current_loss', float('nan'))
-            logger.info(f"  Current loss: {loss_value:.4f}")
-        except (AttributeError, ValueError):
-            logger.info(f"  Current loss: Not available")
+            current_loss = trainer.current_loss # Get current_loss directly
+            loss_display = f"{current_loss:.4f}" if current_loss is not None else "N/A"
+            logger.info(f"  Current loss: {loss_display}")
+        except AttributeError:
+            logger.info(f"  Current loss: Not available (attribute not found)")
         
         if torch.cuda.is_available():
             logger.info(f"Final GPU Memory Usage: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
@@ -567,10 +567,11 @@ def test_real_training(pretraining=True, sft=True):
             f.write(f"  Training time: {train_duration:.1f} seconds\n")
             f.write(f"  Throughput: {throughput:.2f} samples/second\n")
             try:
-                loss_value = getattr(trainer, 'current_loss', float('nan'))
-                f.write(f"  Final loss: {loss_value:.4f}\n")
-            except (AttributeError, ValueError):
-                f.write(f"  Final loss: Not available\n")
+                current_loss = getattr(trainer, 'current_loss', None) # Use None as default for checking
+                loss_display = f"{current_loss:.4f}" if current_loss is not None else "N/A"
+                f.write(f"  Final loss: {loss_display}\n")
+            except AttributeError: # Should not happen with getattr, but good for safety
+                f.write(f"  Final loss: Not available (attribute not found)\n")
             if torch.cuda.is_available():
                 f.write(f"  Peak GPU Memory: {torch.cuda.max_memory_allocated() / 1024**3:.1f} GB\n")
             f.write(f"\nGradient Analysis:\n")
@@ -621,7 +622,9 @@ def test_real_training(pretraining=True, sft=True):
             elif not result['success']:
                 f.write(f"  {mode.upper()}: Failed - {result['error']}\n")
             else:
-                f.write(f"  {mode.upper()}: Success - Loss: {result['loss']:.4f}, Steps: {result['steps_completed']}\n")
+                loss_val = result['loss']
+                loss_display = f"{loss_val:.4f}" if loss_val is not None else "N/A"
+                f.write(f"  {mode.upper()}: Success - Loss: {loss_display}, Steps: {result['steps_completed']}\n")
         
         f.write(f"\nRecommendation for Production Training:\n")
         if all(result is not None and result['success'] for result in results.values() if result is not None):
