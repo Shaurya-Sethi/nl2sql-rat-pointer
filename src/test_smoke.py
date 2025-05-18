@@ -160,9 +160,19 @@ def test_smoke_setup():
         assert outputs['encoder_output'].shape == (batch['encoder_input_ids'].shape[0], batch['encoder_input_ids'].shape[1], d_model)
         
         logger.info("Smoke test PASSED!")
+        
+        # Free up GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         return True
     except Exception as e:
         logger.error(f"Smoke test FAILED: {str(e)}", exc_info=True)
+        
+        # Free up GPU memory even after error
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         return False
 
 if __name__ == '__main__':

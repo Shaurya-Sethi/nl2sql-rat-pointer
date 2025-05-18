@@ -197,6 +197,10 @@ class Evaluator:
         for metric_name, value in metrics.items():
             logger.info(f"{metric_name}: {value:.4f}")
             
+        # Free up GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         return metrics
 
 def evaluate_model(model_checkpoint_path: str, config_path: str):
@@ -215,7 +219,8 @@ def evaluate_model(model_checkpoint_path: str, config_path: str):
         relation_builder = RelationMatrixBuilder(
             sp_model_path=config.sp_model_path,
             special_tokens=config.special_tokens,
-            num_relations=config.num_relations
+            num_relations=config.num_relations,
+            phase_max_len=getattr(config, 'phase_max_len_pg', 1664)  # Use config's phase_max_len_pg or default 1664
         )
         
         model = NL2SQLTransformer(

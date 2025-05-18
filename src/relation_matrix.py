@@ -39,7 +39,8 @@ class RelationMatrixBuilder:
     def __init__(self,
                  sp_model_path: str,
                  special_tokens: Dict[str, str],   # pieces, e.g. '<PK>'
-                 num_relations: int = 5):
+                 num_relations: int = 5,
+                 phase_max_len: int = 1664):  # Added phase_max_len parameter with default
         """
         Initialize relation matrix builder.
         
@@ -47,6 +48,7 @@ class RelationMatrixBuilder:
             sp_model_path: Path to sentencepiece model
             special_tokens: Dictionary of special token strings
             num_relations: Number of relation types
+            phase_max_len: Maximum allowed sequence length for relation matrix
         """
         try:
             self.sp = spm.SentencePieceProcessor()
@@ -75,6 +77,7 @@ class RelationMatrixBuilder:
                     raise ValueError(f"Invalid special token '{k}' ({v}): {e}")
 
             self.num_relations = num_relations
+            self.phase_max_len = phase_max_len  # Store max length
             
             if num_relations < len(self._REL_MAP):
                 raise ValueError(f"num_relations={num_relations} must be at least {len(self._REL_MAP)}")
@@ -322,6 +325,13 @@ class RelationMatrixBuilder:
         """
         try:
             seq_len = len(full_ids)
+            
+            # Check if sequence length exceeds the maximum allowed length
+            if seq_len > self.phase_max_len:
+                error_msg = f"Relation matrix input too large: {seq_len} > {self.phase_max_len}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+                
             rel = torch.zeros((seq_len, seq_len), dtype=torch.long)
 
             # Parse schema tokens if not provided
@@ -431,6 +441,12 @@ class RelationMatrixBuilder:
             if not schema_ids:
                 logger.error("Schema encoding produced empty ID list")
                 return torch.zeros((1, 1), dtype=torch.long)
+            
+            # Check if encoded schema length exceeds the maximum
+            if len(schema_ids) > self.phase_max_len:
+                error_msg = f"Schema too large: {len(schema_ids)} tokens > {self.phase_max_len} max_len"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
                 
             # Build relation matrix
             return self.build_relation_matrix(schema_ids)

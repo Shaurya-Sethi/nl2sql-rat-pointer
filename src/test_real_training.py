@@ -381,7 +381,7 @@ def test_real_training(pretraining=True, sft=True):
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize model
+        # Create model with pointer-generator
         model = NL2SQLTransformer(
             vocab_size=config.vocab_size,
             num_relations=config.num_relations,
@@ -398,6 +398,10 @@ def test_real_training(pretraining=True, sft=True):
         # Get the appropriate max_len for dataset truncation
         dataset_max_len = config.get_dataset_max_len()
         logger.info(f"Using max_len {dataset_max_len} for dataset truncation (model's max_len: {config.max_len})")
+
+        # Determine phase_max_len for RelationMatrixBuilder - use the config value if available
+        phase_max_len = getattr(config, 'phase_max_len_pg', dataset_max_len)
+        logger.info(f"Using phase_max_len {phase_max_len} for relation matrix building")
 
         # Load only a small subset of the training data (100 samples)
         logger.info("Loading small subset of training data")

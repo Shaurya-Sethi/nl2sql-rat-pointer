@@ -16,6 +16,7 @@ from utils.training import Trainer
 from utils.metrics import compute_metrics # This is a simple acc/loss, not full eval.
 from Pretraining_dataset import PretrainingDataset
 from SFT_dataset import SFTDataset
+import signal  # Added for signal handling
 
 # Set up logging
 logging.basicConfig(
@@ -23,6 +24,32 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Global variable to hold trainer instance for signal handlers
+global_trainer = None
+
+# Signal handlers for graceful shutdown
+def handle_signal(signum, frame):
+    """Handle termination signals by saving checkpoint and exiting gracefully"""
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    logger.info(f"{sig_name} received, saving checkpoint and shutting down gracefully.")
+    
+    if global_trainer is not None:
+        try:
+            # Save checkpoint
+            global_trainer.save_checkpoint(is_best=False)
+            logger.info("Checkpoint saved successfully.")
+            
+            # Close TensorBoard writer
+            global_trainer._close_writer()
+            logger.info("TensorBoard writer closed.")
+        except Exception as e:
+            logger.error(f"Error during graceful shutdown: {e}")
+    else:
+        logger.warning(f"{sig_name} received but trainer not initialized yet. Exiting without saving.")
+    
+    # Exit with success status
+    sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(description='Train NL2SQL model')
@@ -71,7 +98,8 @@ def main():
     relation_builder = RelationMatrixBuilder(
         sp_model_path=model_config.sp_model_path,
         special_tokens=model_config.special_tokens,
-        num_relations=model_config.num_relations
+        num_relations=model_config.num_relations,
+        phase_max_len=model_config.phase_max_len if hasattr(model_config, 'phase_max_len') else 1664
     )
 
     # Initialize model
@@ -153,6 +181,7 @@ def main():
         collate_fn=collate_fn_to_use
     )
 
+    global global_trainer  # Use the global trainer variable
     trainer = Trainer(
         model=model,
         config=model_config,
@@ -160,6 +189,7 @@ def main():
         val_dataloader=eval_loader,
         device=device,
     )
+    global_trainer = trainer  # Set the global trainer for signal handlers
 
     if args.phase == 'sft' and args.pretrained_model:
         try:
@@ -167,6 +197,11 @@ def main():
             logger.info(f"Successfully loaded weights from checkpoint: {args.pretrained_model}")
         except Exception as e:
             logger.error(f"Failed to load checkpoint {args.pretrained_model}: {e}. Starting SFT from scratch.")
+
+    # Register signal handlers
+    logger.info("Registering signal handlers for graceful shutdown")
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
     logger.info(f"Starting {args.phase} training for {model_config.max_steps} steps...")
     steps_per_epoch = len(train_loader) // model_config.gradient_accumulation_steps

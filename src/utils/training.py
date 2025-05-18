@@ -1151,6 +1151,11 @@ class Trainer:
                 # Save regular checkpoint
                 if (epoch + 1) % self.config.save_steps == 0:
                     self.save_checkpoint()
+                
+                # Clear CUDA cache to reduce memory fragmentation
+                if torch.cuda.is_available():
+                    logger.info("Clearing CUDA cache to reduce memory fragmentation")
+                    torch.cuda.empty_cache()
                     
             # TensorBoard writer is now closed in the finally block
                     

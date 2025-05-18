@@ -268,6 +268,11 @@ def test_training():
     trainer.train(num_epochs=1) 
     logger.info("Test training run (1 epoch) completed.")
     
+    # Clear CUDA cache to reduce memory fragmentation
+    if torch.cuda.is_available():
+        logger.info("Clearing CUDA cache to reduce memory fragmentation")
+        torch.cuda.empty_cache()
+    
     checkpoint_files = list(Path(config.output_dir).glob('checkpoint-*.pt'))
     if not checkpoint_files:
         # If save_steps > steps_in_1_epoch, no checkpoint will be saved for is_best=False
@@ -314,6 +319,11 @@ def test_training():
     logger.info("Continuing training from checkpoint (1 more epoch)...")
     new_trainer.train(num_epochs=1)
     logger.info("Test training continuation from checkpoint completed.")
+
+    # Clear CUDA cache to reduce memory fragmentation
+    if torch.cuda.is_available():
+        logger.info("Clearing CUDA cache to reduce memory fragmentation")
+        torch.cuda.empty_cache()
 
     if torch.cuda.is_available():
         logger.info(f"Final GPU Memory Usage: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")

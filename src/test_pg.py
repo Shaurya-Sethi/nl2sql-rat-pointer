@@ -123,4 +123,8 @@ def test_pointer_generator_in_model():
 if __name__ == "__main__":
     test_pointer_generator_decoder()
     test_pointer_generator_in_model()
-    print("All tests passed!") 
+    print("All tests passed!")
+    
+    # Free up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache() 
