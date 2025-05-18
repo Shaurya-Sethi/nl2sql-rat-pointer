@@ -71,11 +71,22 @@ class SFTDataset(Dataset):
         labels = torch.tensor(target_tokens, dtype=torch.long)
         relation_matrix = torch.tensor(relation_matrix, dtype=torch.long)
         
+        # Create schema mask for pointer-generator
+        # Parse schema tokens from input tokens
+        schema_tokens = self.relation_builder.parse_schema_tokens(input_tokens)
+        schema_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        
+        # Set mask to True for all schema tokens (columns, tables, PKs, FKs)
+        for token in schema_tokens:
+            # Include span from start to end inclusive
+            schema_mask[token.span_start:token.span_end+1] = True
+        
         return {
             'encoder_input': input_ids,
             'decoder_target': labels,
             'encoder_attention_mask': attention_mask,
-            'relation_matrix': relation_matrix
+            'relation_matrix': relation_matrix,
+            'schema_mask': schema_mask  # New field for pointer-generator
         }
 
     @staticmethod
@@ -84,7 +95,7 @@ class SFTDataset(Dataset):
         Collate function for the dataloader.
         
         Args:
-            batch: List of dictionaries containing encoder_input, decoder_target, encoder_attention_mask, and relation_matrix
+            batch: List of dictionaries containing encoder_input, decoder_target, encoder_attention_mask, relation_matrix, and schema_mask
             pad_id (int): Pad token ID
             
         Returns:
@@ -98,6 +109,7 @@ class SFTDataset(Dataset):
         decoder_target = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
         encoder_attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
         relation_matrix = torch.zeros(batch_size, max_len, max_len, dtype=torch.long)
+        schema_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)  # Initialize with False
         
         # Fill tensors
         for i, item in enumerate(batch):
@@ -106,10 +118,12 @@ class SFTDataset(Dataset):
             decoder_target[i, :length] = item['decoder_target']
             encoder_attention_mask[i, :length] = item['encoder_attention_mask']
             relation_matrix[i, :length, :length] = item['relation_matrix']
+            schema_mask[i, :length] = item['schema_mask']  # Copy schema mask with padding
         
         return {
             'encoder_input': encoder_input,
             'decoder_target': decoder_target,
             'encoder_attention_mask': encoder_attention_mask,
-            'relation_matrix': relation_matrix
+            'relation_matrix': relation_matrix,
+            'schema_mask': schema_mask  # Include schema mask in batch
         }

@@ -14,6 +14,7 @@ class NL2SQLConfig:
     num_relations: int
     dropout: float
     max_len: int
+    use_pointer_generator: bool  # Whether to use pointer-generator for copying schema tokens
     
     # Tokenizer
     special_tokens: Dict[str, str]
@@ -61,6 +62,7 @@ class NL2SQLConfig:
             num_relations=config_dict['model']['num_relations'],
             dropout=config_dict['model']['dropout'],
             max_len=config_dict['model']['max_len'],
+            use_pointer_generator=config_dict['model'].get('use_pointer_generator', False),  # Default to False if not specified
             
             # Tokenizer
             special_tokens=config_dict['tokenizer']['special_tokens'],
@@ -99,6 +101,7 @@ class NL2SQLConfig:
         assert self.num_relations > 0, "num_relations must be positive"
         assert 0 <= self.dropout <= 1, "dropout must be between 0 and 1"
         assert self.max_len > 0, "max_len must be positive"
+        assert isinstance(self.use_pointer_generator, bool), "use_pointer_generator must be a boolean"
         
         # Training validation
         assert self.batch_size > 0, "batch_size must be positive"

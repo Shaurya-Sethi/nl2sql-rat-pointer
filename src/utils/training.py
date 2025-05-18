@@ -114,14 +114,25 @@ class Trainer:
                         encoder_input_ids=batch['encoder_input'],
                         decoder_input_ids=batch['decoder_target'][:, :-1],
                         encoder_relation_ids=batch['relation_matrix'],
-                        encoder_attention_mask=encoder_attention_mask
+                        encoder_attention_mask=encoder_attention_mask,
+                        schema_mask=batch.get('schema_mask')  # Pass schema_mask if available
                     )
                     
-                    # Calculate loss
-                    loss = nn.CrossEntropyLoss(ignore_index=18)(
-                        outputs['logits'].view(-1, self.config.vocab_size),
-                        batch['decoder_target'][:, 1:].contiguous().view(-1)
-                    )
+                    # Calculate loss - handle both standard logits and log_probs
+                    if 'logits' in outputs:
+                        # Standard decoder output
+                        loss = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)(
+                            outputs['logits'].view(-1, self.config.vocab_size),
+                            batch['decoder_target'][:, 1:].contiguous().view(-1)
+                        )
+                    elif 'log_probs' in outputs:
+                        # Pointer-generator output (already in log space)
+                        loss = nn.NLLLoss(ignore_index=self.config.pad_token_id)(
+                            outputs['log_probs'].view(-1, self.config.vocab_size),
+                            batch['decoder_target'][:, 1:].contiguous().view(-1)
+                        )
+                    else:
+                        raise ValueError("Model output must contain either 'logits' or 'log_probs'")
                     
                     # Scale loss for gradient accumulation
                     loss = loss / self.gradient_accumulation_steps
@@ -214,14 +225,25 @@ class Trainer:
                         encoder_input_ids=batch['encoder_input'],
                         decoder_input_ids=batch['decoder_target'][:, :-1],
                         encoder_relation_ids=batch['relation_matrix'],
-                        encoder_attention_mask=encoder_attention_mask
+                        encoder_attention_mask=encoder_attention_mask,
+                        schema_mask=batch.get('schema_mask')  # Pass schema_mask if available
                     )
                     
-                    # Calculate loss
-                    loss = nn.CrossEntropyLoss(ignore_index=18)(
-                        outputs['logits'].view(-1, self.config.vocab_size),
-                        batch['decoder_target'][:, 1:].contiguous().view(-1)
-                    )
+                    # Calculate loss - handle both standard logits and log_probs
+                    if 'logits' in outputs:
+                        # Standard decoder output
+                        loss = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)(
+                            outputs['logits'].view(-1, self.config.vocab_size),
+                            batch['decoder_target'][:, 1:].contiguous().view(-1)
+                        )
+                    elif 'log_probs' in outputs:
+                        # Pointer-generator output (already in log space)
+                        loss = nn.NLLLoss(ignore_index=self.config.pad_token_id)(
+                            outputs['log_probs'].view(-1, self.config.vocab_size),
+                            batch['decoder_target'][:, 1:].contiguous().view(-1)
+                        )
+                    else:
+                        raise ValueError("Model output must contain either 'logits' or 'log_probs'")
                     
                     # Update metrics
                     total_loss += loss.item()

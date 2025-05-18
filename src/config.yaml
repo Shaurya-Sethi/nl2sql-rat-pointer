@@ -9,6 +9,7 @@ model:
   num_relations:     5
   dropout:           0.1
   max_len:           2048       # Maximum sequence length
+  use_pointer_generator: true   # Use pointer-generator for copying schema tokens
 
 tokenizer:
   pad_token_id: 18             # Keep our current pad_token_id
