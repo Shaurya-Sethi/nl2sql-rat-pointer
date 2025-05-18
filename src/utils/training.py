@@ -15,6 +15,7 @@ import time
 from datetime import datetime
 import socket
 import re
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -978,7 +979,12 @@ class Trainer:
                 'best_val_loss': self.best_val_loss,
                 'config': self.config,
                 'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-                'model_config': model_config  # Add model configuration
+                'model_config': model_config,  # Add model configuration
+                # RNG states for reproducibility
+                'torch_rng_state': torch.get_rng_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                'numpy_rng_state': np.random.get_state(),
+                'python_rng_state': random.getstate()
             }
             
             # Create output directory if it doesn't exist
@@ -1071,9 +1077,43 @@ class Trainer:
             self.best_val_loss = checkpoint['best_val_loss']
             
             logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+            # Restore RNG states for reproducibility
+            logger.info("Attempting to restore RNG states from checkpoint for reproducibility...")
+            rng_keys_to_restore = {
+                'torch_rng_state': (lambda state: torch.set_rng_state(state), "PyTorch CPU RNG state"),
+                'numpy_rng_state': (lambda state: np.random.set_state(state), "NumPy RNG state"),
+                'python_rng_state': (lambda state: random.setstate(state), "Python random module RNG state")
+            }
+            if torch.cuda.is_available():
+                # Only attempt to restore CUDA RNG if CUDA is currently available
+                rng_keys_to_restore['cuda_rng_state'] = (lambda state: torch.cuda.set_rng_state(state), "PyTorch CUDA RNG state")
+
+            all_expected_rng_keys_restored_or_handled = True
+            for key, (setter, name) in rng_keys_to_restore.items():
+                if key in checkpoint:
+                    if key == 'cuda_rng_state' and checkpoint[key] is None:
+                        # This case means CUDA was not available or not used during checkpoint saving.
+                        # If CUDA is available now, its RNG state is not being restored from a None state.
+                        logger.info(f"  - {name} was None in checkpoint (e.g., saved on CPU-only or CUDA not used). Current CUDA RNG state preserved.")
+                    else:
+                        try:
+                            setter(checkpoint[key])
+                            logger.info(f"  - Successfully restored {name}.")
+                        except Exception as e:
+                            logger.error(f"  - Failed to restore {name}: {e}")
+                            all_expected_rng_keys_restored_or_handled = False
+                else:
+                    logger.warning(f"  - {name} not found in checkpoint. This might affect exact reproducibility if loading an older checkpoint.")
+                    all_expected_rng_keys_restored_or_handled = False
             
+            if not all_expected_rng_keys_restored_or_handled:
+                logger.warning("One or more RNG states were missing or failed to restore from the checkpoint. Full reproducibility might be affected if this checkpoint is from an older version or a different environment.")
+            else:
+                logger.info("All available and expected RNG states successfully restored or appropriately handled from checkpoint.")
+
         except Exception as e:
-            logger.error(f"Error loading checkpoint: {e}")
+            logger.error(f"Error loading checkpoint: {e}", exc_info=True) # Added exc_info for better debugging
             raise
             
     def train(self, num_epochs: int):
