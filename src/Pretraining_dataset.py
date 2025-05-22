@@ -28,54 +28,51 @@ class PretrainingDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.examples[idx]
-        
-        # Tokenize
         tokens = self.tokenizer.encode(example)
-        
-        # Truncate if necessary
         if len(tokens) > self.max_len:
             tokens = tokens[:self.max_len]
-        
-        # Create input_ids and attention_mask
         input_ids = torch.tensor(tokens, dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-        
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        seq_len = input_ids.size(0)
+        # Dummies for keys expected by the Trainer
+        relation_matrix = torch.zeros((seq_len, seq_len), dtype=torch.long)
+        schema_mask = torch.zeros(seq_len, dtype=torch.bool)
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': input_ids.clone()  # For language modeling, labels are same as input
+            'encoder_input': input_ids,                   # what the Trainer expects
+            'encoder_attention_mask': attention_mask,     # what the Trainer expects
+            'decoder_target': input_ids.clone(),          # labels = inputs for LM pretraining
+            'relation_matrix': relation_matrix,           # dummy, not used in pretrain
+            'schema_mask': schema_mask,                   # dummy, not used in pretrain
         }
 
     @staticmethod
     def collate_fn(batch, pad_id=18):
         """
         Collate function for the dataloader.
-        
-        Args:
-            batch: List of dictionaries containing input_ids, attention_mask, and labels
-            pad_id (int): Padding ID
-            
-        Returns:
-            Dictionary of batched tensors
+        Returns batch dict with all keys Trainer expects, padded.
         """
         # Get max length in this batch
-        max_len = max(len(item['input_ids']) for item in batch)
-        
-        # Initialize tensors with pad_id
+        max_len = max(len(item['encoder_input']) for item in batch)
         batch_size = len(batch)
-        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
-        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long)
-        labels = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
-        
-        # Fill tensors
+
+        encoder_input = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        encoder_attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
+        decoder_target = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        relation_matrix = torch.zeros((batch_size, max_len, max_len), dtype=torch.long)
+        schema_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+
         for i, item in enumerate(batch):
-            length = len(item['input_ids'])
-            input_ids[i, :length] = item['input_ids']
-            attention_mask[i, :length] = item['attention_mask']
-            labels[i, :length] = item['labels']
-        
+            length = len(item['encoder_input'])
+            encoder_input[i, :length] = item['encoder_input']
+            encoder_attention_mask[i, :length] = item['encoder_attention_mask']
+            decoder_target[i, :length] = item['decoder_target']
+            relation_matrix[i, :length, :length] = item['relation_matrix']
+            schema_mask[i, :length] = item['schema_mask']
+
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
+            'encoder_input': encoder_input,
+            'encoder_attention_mask': encoder_attention_mask,
+            'decoder_target': decoder_target,
+            'relation_matrix': relation_matrix,
+            'schema_mask': schema_mask,
         }

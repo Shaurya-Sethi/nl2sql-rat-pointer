@@ -1,11 +1,11 @@
 # ======================================================
-#  Shared model / tokenizer
+#  Shared model / tokenizer - L4 BASELINE
 # ======================================================
 model:
   vocab_size:        32000
-  d_model:           1344          # 350 M parameters (unchanged)
-  n_heads:           21
-  n_layers:          12
+  d_model:           768           # ↓ from 1344
+  n_heads:           12            # must divide d_model
+  n_layers:          8             # ↓ from 12
   num_relations:     5
   dropout:           0.1
   max_len:           2048
@@ -34,23 +34,23 @@ tokenizer:
 # ======================================================
 pretrain:
   # ---------- data ----------------------------------- #
-  train_file:  "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
-  eval_file:   "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
-  epochs:      3
+  train_file:  "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
+  eval_file:   "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
+  epochs:      4
   max_len:     512
 
   # ---------- batch / accumulation ------------------- #
-  micro_batch_size:      12       # ↑ (24 GB VRAM allows larger per-step batch)
-  gradient_accumulation: 6        # keeps effective batch ≈ 72
-  max_batch_size:        24       # validation
+  micro_batch_size:      4       # fits with new model
+  gradient_accumulation: 8       # eff-batch 32
+  max_batch_size:        16      # validation
 
   # ---------- optimisation --------------------------- #
-  learning_rate:   2.0e-4
+  learning_rate:   1.0e-4
   scheduler:       cosine
-  warmup_steps:    3000
-  max_steps:       46875          # unchanged (epochs × data / eff-batch)
+  warmup_steps:    2500
+  max_steps:       46875
   weight_decay:    0.01
-  max_grad_norm:   1.0
+  max_grad_norm:   0.5
 
   # ---------- runtime -------------------------------- #
   mixed_precision:        true     # fp16/ bf16 autocast
@@ -63,17 +63,17 @@ pretrain:
 
 sft:
   # ---------- data ----------------------------------- #
-  train_file:  "datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
-  eval_file:   "datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
-  epochs:      3
+  train_file:  "src/datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
+  eval_file:   "src/datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
+  epochs:      4
 
   # ---------- batch / accumulation ------------------- #
-  micro_batch_size:      2        # ↑ (24 GB lets us double the per-step batch)
-  gradient_accumulation: 16       # effective batch = 32 (same as before)
-  max_batch_size:        16       # validation
+  micro_batch_size:      1        # fits 1664-token context
+  gradient_accumulation: 32       # eff-batch 32
+  max_batch_size:        8
 
   # ---------- optimisation --------------------------- #
-  learning_rate:   5.0e-5
+  learning_rate:   3.0e-5
   scheduler:       cosine
   warmup_steps:    3000
   max_steps:       206250

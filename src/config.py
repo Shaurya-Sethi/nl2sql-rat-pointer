@@ -59,6 +59,9 @@ class NL2SQLConfig:
     sp_model_path: str
     output_dir: str
     
+    train_file: str
+    eval_file: str
+    
     # TensorBoard logging
     tensorboard_log_dir: Optional[str] = None  # Directory for TensorBoard logs, e.g., 'runs/exp1'
     log_every_n_steps: int = 10  # Log training metrics every N steps
@@ -176,6 +179,8 @@ class NL2SQLConfig:
             # SFT specific lengths for PG and clarity
             phase_max_len_pg=phase_config.get('phase_max_len') if phase == 'sft' else None,
             max_sql_len=phase_config.get('max_sql_len') if phase == 'sft' else None,
+            train_file=phase_config['train_file'],
+            eval_file=phase_config['eval_file']
         )
         
         # Overwrite phase_max_len with the SFT-specific one if in SFT phase and it exists

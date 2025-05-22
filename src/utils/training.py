@@ -19,6 +19,20 @@ import random
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_hparams(hparams):
+    allowed_types = (int, float, str, bool)
+    clean_hparams = {}
+    for k, v in hparams.items():
+        if isinstance(v, allowed_types):
+            clean_hparams[k] = v
+        elif isinstance(v, torch.Tensor) and v.numel() == 1:
+            clean_hparams[k] = v.item()
+        elif v is not None:
+            clean_hparams[k] = str(v)
+    return clean_hparams
+
+
 class Trainer:
     def __init__(
         self,
@@ -186,7 +200,7 @@ class Trainer:
             
             # Log the hyperparameters with an empty metrics dict
             # The actual metrics will be logged during training
-            self.writer.add_hparams(hparams, {})
+            self.writer.add_hparams(_sanitize_hparams(hparams), {})
             
             # Write a text summary of the training configuration
             config_text = f"# NL2SQL Training Configuration\n\n"
