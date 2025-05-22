@@ -3,16 +3,16 @@
 # ======================================================
 model:
   vocab_size:        32000
-  d_model:           1344          # Using user's calculated block size
-  n_heads:           21            # Must be a divisor of d_model
-  n_layers:          12            # 6 → 12 → ~350 M params
+  d_model:           1344          # 350M parameters
+  n_heads:           21            # Must divide d_model
+  n_layers:          12            # ~350M params
   num_relations:     5
   dropout:           0.1
-  max_len:           2048          # Maximum sequence length
-  use_pointer_generator: true      # Use pointer-generator for copying schema tokens
+  max_len:           2048          # Max context length (for eval/inference)
+  use_pointer_generator: true
 
 tokenizer:
-  pad_token_id: 18             # Keep our current pad_token_id
+  pad_token_id: 18
   special_tokens:
     SCHEMA_START: "<SCHEMA>"
     SCHEMA_END:   "</SCHEMA>"
@@ -33,54 +33,51 @@ tokenizer:
 #  Phase-specific hyper-parameters
 # ======================================================
 pretraining:
-  # ---------- data (decoder-only SQL corpus) ------------------------- #
   train_file:                 "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
   eval_file:                  "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
   epochs:                     3
-  # use shorter sequences for cheaper compute
-  max_len:                    512              # NEW (dataset trim length)
-  # ---------- micro-batch & accumulation ---------------------------- #
-  micro_batch_size:           16        # fits comfortably in 40 GB
-  max_batch_size:            32         # Maximum batch size for validation
-  gradient_accumulation:      4         # effective batch = 64
-  # ---------- optimisation ------------------------------------------ #
-  learning_rate:              2.0e-4    # was 3e-4
+  max_len:                    512         # Use shorter sequences for pretraining (memory/cost saver)
+  # ------------------- GPU-mem optimized batch -----------------------
+  micro_batch_size:           8            # Lowered for T4/V100 (from 16)
+  max_batch_size:             16
+  gradient_accumulation:      8            # To keep effective batch = 64
+  # ------------------- optimization ----------------------------------
+  learning_rate:              2.0e-4
   scheduler:                  cosine
-  warmup_steps:               3000      # ≈6% of total steps
-  max_steps:                  46875     # 3 epochs × 1M / 64
-  weight_decay:               0.01      # was 0.10
+  warmup_steps:               3000
+  max_steps:                  46875
+  weight_decay:               0.01
   max_grad_norm:              1.0
-  # ---------- runtime ----------------------------------------------- #
-  mixed_precision:            true      # fp16
+  # ------------------- runtime ---------------------------------------
+  mixed_precision:            true         # Use fp16 (not bf16)
   use_8bit_optimizer:         true
-  bf16:                       true      # use BF16 on A100
+  bf16:                       false        # Only on A100; T4/V100 use fp16
   gradient_checkpointing:     true
   save_steps:                 2000
   num_workers:                4
-  early_stopping_patience:    null      # disable early stop
+  early_stopping_patience:    null
 
 sft:
-  # ---------- data (question+schema+CoT+SQL) ------------------------ #
   train_file:                 "datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
   eval_file:                  "datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
-  epochs:                     3         # 2 → 3
-  # ---------- micro-batch & accumulation ---------------------------- #
-  micro_batch_size:           2         # long 2048-token enc/dec pairs
-  max_batch_size:            32         # Maximum batch size for validation
-  gradient_accumulation:      16        # effective batch = 32
-  # ---------- optimisation ------------------------------------------ #
+  epochs:                     3
+  # ------------------- GPU-mem optimized batch -----------------------
+  micro_batch_size:           1            # 2048-token context is heavy; batch 1 is safest
+  max_batch_size:             16
+  gradient_accumulation:      32           # To keep effective batch = 32
+  # ------------------- optimization ----------------------------------
   learning_rate:              5.0e-5
   scheduler:                  cosine
-  warmup_steps:               3000      # ≈2% of total steps
-  max_steps:                  206250    # 3 epochs × 2.2M / 32
+  warmup_steps:               3000
+  max_steps:                  206250
   weight_decay:               0.01
   max_grad_norm:              1.0
-  # ---------- SFT specific length constraints ----------------------- #
-  phase_max_len:              1664      # Max length for schema + NL part (for pointer-generator)
-  max_sql_len:                320       # Expected max length for SQL part (for clarity/logging)
-  # ---------- runtime ----------------------------------------------- #
+  # ------------------- SFT length constraints ------------------------
+  phase_max_len:              1664
+  max_sql_len:                320
+  # ------------------- runtime ---------------------------------------
   mixed_precision:            true
-  bf16:                       true      # use BF16 on A100
+  bf16:                       false
   use_8bit_optimizer:         true
   gradient_checkpointing:     true
   save_steps:                 1000
@@ -91,15 +88,15 @@ sft:
 #  Misc paths / outputs
 # ======================================================
 paths:
-  sp_model:   "models/nl2sql_tok.model"  # Keep current model path
-  output_dir: "outputs" 
+  sp_model:   "models/nl2sql_tok.model"
+  output_dir: "outputs"
 
 # ======================================================
 #  Logging configuration
 # ======================================================
 logging:
-  tensorboard_log_dir: "runs"  # Base directory for TensorBoard logs
-  log_every_n_steps: 10        # Log training metrics every N steps
-  log_grad_norm: true          # Whether to log gradient norms
-  log_grad_histogram: false    # Whether to log parameter histograms (expensive)
-  log_memory: true             # Whether to log memory usage 
+  tensorboard_log_dir: "runs"
+  log_every_n_steps: 10
+  log_grad_norm: true
+  log_grad_histogram: false
+  log_memory: true
