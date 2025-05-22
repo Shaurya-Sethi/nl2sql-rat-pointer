@@ -3,12 +3,12 @@
 # ======================================================
 model:
   vocab_size:        32000
-  d_model:           1344          # 350M parameters
-  n_heads:           21            # Must divide d_model
-  n_layers:          12            # ~350M params
+  d_model:           1344          # 350 M parameters (unchanged)
+  n_heads:           21
+  n_layers:          12
   num_relations:     5
   dropout:           0.1
-  max_len:           2048          # Max context length (for eval/inference)
+  max_len:           2048
   use_pointer_generator: true
 
 tokenizer:
@@ -30,59 +30,68 @@ tokenizer:
     EXT_END:      "</EXT>"
 
 # ======================================================
-#  Phase-specific hyper-parameters
+#  Phase-specific hyper-parameters (L4-optimised)
 # ======================================================
 pretraining:
-  train_file:                 "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
-  eval_file:                  "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
-  epochs:                     3
-  max_len:                    512         # Use shorter sequences for pretraining (memory/cost saver)
-  # ------------------- GPU-mem optimized batch -----------------------
-  micro_batch_size:           8            # Lowered for T4/V100 (from 16)
-  max_batch_size:             16
-  gradient_accumulation:      8            # To keep effective batch = 64
-  # ------------------- optimization ----------------------------------
-  learning_rate:              2.0e-4
-  scheduler:                  cosine
-  warmup_steps:               3000
-  max_steps:                  46875
-  weight_decay:               0.01
-  max_grad_norm:              1.0
-  # ------------------- runtime ---------------------------------------
-  mixed_precision:            true         # Use fp16 (not bf16)
-  use_8bit_optimizer:         true
-  bf16:                       false        # Only on A100; T4/V100 use fp16
-  gradient_checkpointing:     true
-  save_steps:                 2000
-  num_workers:                4
-  early_stopping_patience:    null
+  # ---------- data ----------------------------------- #
+  train_file:  "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
+  eval_file:   "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
+  epochs:      3
+  max_len:     512
+
+  # ---------- batch / accumulation ------------------- #
+  micro_batch_size:      12       # ↑ (24 GB VRAM allows larger per-step batch)
+  gradient_accumulation: 6        # keeps effective batch ≈ 72
+  max_batch_size:        24       # validation
+
+  # ---------- optimisation --------------------------- #
+  learning_rate:   2.0e-4
+  scheduler:       cosine
+  warmup_steps:    3000
+  max_steps:       46875          # unchanged (epochs × data / eff-batch)
+  weight_decay:    0.01
+  max_grad_norm:   1.0
+
+  # ---------- runtime -------------------------------- #
+  mixed_precision:        true     # fp16/ bf16 autocast
+  bf16:                   true      # L4 supports bf16; gives more headroom
+  use_8bit_optimizer:     true
+  gradient_checkpointing: true
+  save_steps:             2000
+  num_workers:            4
+  early_stopping_patience: null
 
 sft:
-  train_file:                 "datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
-  eval_file:                  "datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
-  epochs:                     3
-  # ------------------- GPU-mem optimized batch -----------------------
-  micro_batch_size:           1            # 2048-token context is heavy; batch 1 is safest
-  max_batch_size:             16
-  gradient_accumulation:      32           # To keep effective batch = 32
-  # ------------------- optimization ----------------------------------
-  learning_rate:              5.0e-5
-  scheduler:                  cosine
-  warmup_steps:               3000
-  max_steps:                  206250
-  weight_decay:               0.01
-  max_grad_norm:              1.0
-  # ------------------- SFT length constraints ------------------------
-  phase_max_len:              1664
-  max_sql_len:                320
-  # ------------------- runtime ---------------------------------------
-  mixed_precision:            true
-  bf16:                       false
-  use_8bit_optimizer:         true
-  gradient_checkpointing:     true
-  save_steps:                 1000
-  num_workers:                4
-  early_stopping_patience:    3
+  # ---------- data ----------------------------------- #
+  train_file:  "datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
+  eval_file:   "datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
+  epochs:      3
+
+  # ---------- batch / accumulation ------------------- #
+  micro_batch_size:      2        # ↑ (24 GB lets us double the per-step batch)
+  gradient_accumulation: 16       # effective batch = 32 (same as before)
+  max_batch_size:        16       # validation
+
+  # ---------- optimisation --------------------------- #
+  learning_rate:   5.0e-5
+  scheduler:       cosine
+  warmup_steps:    3000
+  max_steps:       206250
+  weight_decay:    0.01
+  max_grad_norm:   1.0
+
+  # ---------- length constraints --------------------- #
+  phase_max_len:   1664
+  max_sql_len:     320
+
+  # ---------- runtime -------------------------------- #
+  mixed_precision:        true
+  bf16:                   true     # enable bf16 for extra VRAM savings
+  use_8bit_optimizer:     true
+  gradient_checkpointing: true
+  save_steps:             1000
+  num_workers:            4
+  early_stopping_patience: 3
 
 # ======================================================
 #  Misc paths / outputs
@@ -96,7 +105,7 @@ paths:
 # ======================================================
 logging:
   tensorboard_log_dir: "runs"
-  log_every_n_steps: 10
-  log_grad_norm: true
-  log_grad_histogram: false
-  log_memory: true
+  log_every_n_steps:   10
+  log_grad_norm:       true
+  log_grad_histogram:  false
+  log_memory:          true
