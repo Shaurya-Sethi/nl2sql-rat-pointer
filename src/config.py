@@ -94,8 +94,8 @@ class NL2SQLConfig:
             KeyError: If required config sections are missing
         """
         # Validate phase
-        if phase not in ['pretraining', 'sft']:
-            raise ValueError(f"Invalid phase: {phase}. Must be 'pretraining' or 'sft'.")
+        if phase not in ['pretrain', 'sft']:
+            raise ValueError(f"Invalid phase: {phase}. Must be 'pretrain' or 'sft'.")
             
         # Check file exists
         if not os.path.exists(yaml_path):

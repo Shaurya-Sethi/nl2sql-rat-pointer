@@ -32,7 +32,7 @@ tokenizer:
 # ======================================================
 #  Phase-specific hyper-parameters (L4-optimised)
 # ======================================================
-pretraining:
+pretrain:
   # ---------- data ----------------------------------- #
   train_file:  "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
   eval_file:   "datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
