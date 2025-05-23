@@ -256,6 +256,10 @@ class Trainer:
         progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
         
         for batch_idx, batch in enumerate(progress_bar):
+            if batch is None:
+                logger.warning(f"Trainer.train_epoch: Epoch {self.epoch}, Batch index {batch_idx}: Received None batch from DataLoader. Skipping.")
+                skipped_batches += 1 # Ensure this variable is initialized if used for overall stats
+                continue
             batch_start_time = time.time()
             
             try:
@@ -778,6 +782,10 @@ class Trainer:
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self.val_dataloader, desc="Validation")):
+                if batch is None:
+                    logger.warning(f"Trainer.validate: Epoch {self.epoch}, Val Batch index {batch_idx}: Received None batch from DataLoader. Skipping.")
+                    skipped_batches += 1 # Ensure this variable is initialized
+                    continue
                 try:
                     # Validate batch
                     if not validate_batch(batch, self.config):
