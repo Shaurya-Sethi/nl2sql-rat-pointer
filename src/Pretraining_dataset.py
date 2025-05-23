@@ -33,10 +33,10 @@ class PretrainingDataset(Dataset):
         
         # Get special token IDs for pretrain truncation rule (preserve <SQL> and </SQL>)
         try:
-            self.sql_token_id = self.tokenizer.get_special_token_id('<SQL>') # As per prompt context
-            self.sql_end_token_id = self.tokenizer.get_special_token_id('</SQL>') # As per prompt context
-        except Exception as e:
-            logger.warning(f"PretrainingDataset: Could not get <SQL> or </SQL> token IDs from tokenizer: {e}. Pretrain truncation might not preserve them.")
+            self.sql_token_id = self.tokenizer.get_special_token_id('SQL_START') # Use defined name
+            self.sql_end_token_id = self.tokenizer.get_special_token_id('SQL_END') # Use defined name
+        except KeyError as e:  # Catch specifically KeyError if a name is not found
+            logger.warning(f"PretrainingDataset: Could not get SQL_START or SQL_END token IDs from tokenizer: {e}. Pretrain truncation might not preserve them.")
             self.sql_token_id = None
             self.sql_end_token_id = None
 
