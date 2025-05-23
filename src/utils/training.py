@@ -16,6 +16,7 @@ from datetime import datetime
 import socket
 import re
 import random
+import contextlib # Added for nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +277,8 @@ class Trainer:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Forward pass with mixed precision
-                with torch.amp.autocast('cuda') if self.mixed_precision else torch.no_grad():
+                autocast_context = torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16 if self.config.use_bf16 else torch.float16) if self.mixed_precision else contextlib.nullcontext()
+                with autocast_context:
                     # Reshape attention mask to (batch_size, seq_len, seq_len)
                     encoder_attention_mask = batch['encoder_attention_mask'].unsqueeze(1).expand(-1, batch['encoder_attention_mask'].size(1), -1)
                     

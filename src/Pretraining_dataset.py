@@ -28,7 +28,8 @@ class PretrainingDataset(Dataset):
 
     def __getitem__(self, idx):
         example = self.examples[idx]
-        tokens = self.tokenizer.encode(example)
+        # Split the string of token IDs and convert to integers
+        tokens = [int(token_id) for token_id in example.split()]
         if len(tokens) > self.max_len:
             tokens = tokens[:self.max_len]
         input_ids = torch.tensor(tokens, dtype=torch.long)
