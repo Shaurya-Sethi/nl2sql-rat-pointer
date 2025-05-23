@@ -279,7 +279,7 @@ class SFTDataset(Dataset):
             encoder_attention_mask_batch[i, :enc_len] = item['encoder_attention_mask']
             
             # Relation matrix and schema mask checks (shape based on enc_len)
-            if 'relation_matrix' in item and item['relation_matrix'].ndim == 2 and \ 
+            if 'relation_matrix' in item and item['relation_matrix'].ndim == 2 and\
                item['relation_matrix'].shape[0] == enc_len and item['relation_matrix'].shape[1] == enc_len:
                 relation_matrix_batch[i, :enc_len, :enc_len] = item['relation_matrix']
             # else: (Optional: log if shape mismatch and non-default tensor was provided)
