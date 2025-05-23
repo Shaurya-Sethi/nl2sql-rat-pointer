@@ -55,7 +55,7 @@ class SFTDataset(Dataset):
         # Based on user feedback, a generic 'EOS' token is not used to mark overall sequence end.
         # The sequences are concatenations like schema-NL-COT-SQL, ending with SQL_END.
         self.sft_end_special_tokens = {self.sql_end_token_id}
-        logger.info(f"SFTDataset: Using {{ {self.sql_end_token_id}: '{self.tokenizer.special_tokens.get("SQL_END")}' }} as special end tokens for SFT truncation preservation.")
+        logger.info(f"SFTDataset: Using {{ {self.sql_end_token_id}: '{self.tokenizer.special_tokens.get('SQL_END')}' }} as special end tokens for SFT truncation preservation.")
 
         self.dropped_count = 0
         self.truncated_count = 0
