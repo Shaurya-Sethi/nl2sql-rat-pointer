@@ -6,7 +6,8 @@ logger = logging.getLogger(__name__)
 def ensure_bnb_state(optimizer, device=None):
     """
     For every parameter in a bitsandbytes optimizer that lacks momentum ('state1'),
-    variance ('state2'), or 'step' buffers, create them to prevent 'state1' KeyError.
+    variance ('state2'), or 'step' buffers, create them to prevent 'state1' KeyError
+    and TypeError with 'step'.
 
     Args:
         optimizer: The bitsandbytes optimizer instance.
@@ -47,9 +48,13 @@ def ensure_bnb_state(optimizer, device=None):
                 current_param_created_any_buffer = True
 
             if "step" not in state:
-                # 'step' is used by some optimizers like Adam for bias correction
-                state["step"] = torch.zeros(1, dtype=torch.int64, device=param_device)
+                state["step"] = 0  # Use a plain Python int for step
                 current_param_created_any_buffer = True
+            elif isinstance(state["step"], torch.Tensor):
+                # Ensure existing tensor steps are converted to int
+                logger.debug(f"Converting tensor step to int for param {p_idx} in group {group_idx}.")
+                state["step"] = int(state["step"].item())
+                # We don't count this as a newly created buffer, but as a correction.
             
             if current_param_created_any_buffer:
                 created_buffers_count +=1 # Count params for which at least one buffer was made
@@ -58,4 +63,29 @@ def ensure_bnb_state(optimizer, device=None):
         logger.info(f"Initialised missing BnB state (state1/state2/step) for {created_buffers_count} parameter(s).")
     else:
         # This log can be noisy if called every batch, consider adjusting if needed
-        logger.debug("ensure_bnb_state: All parameters checked appear to have state1/state2/step buffers.") 
+        logger.debug("ensure_bnb_state: All parameters checked appear to have state1/state2/step buffers, or steps were already int.") 
+
+def cleanup_bnb_step_tensors(optimizer):
+    """
+    Converts any 'step' entries in the optimizer state that are tensors to Python integers.
+    This is to ensure compatibility with bitsandbytes optimizers that expect int steps.
+    Args:
+        optimizer: The optimizer whose state needs to be cleaned up.
+    """
+    converted_count = 0
+    if not hasattr(optimizer, 'state') or not optimizer.state:
+        logger.debug("Optimizer has no state or state is empty, skipping step tensor cleanup.")
+        return
+
+    for param_state in optimizer.state.values():
+        if "step" in param_state and isinstance(param_state["step"], torch.Tensor):
+            try:
+                param_state["step"] = int(param_state["step"].item())
+                converted_count += 1
+            except Exception as e:
+                logger.error(f"Failed to convert tensor step to int: {e}. Current step value: {param_state['step']}")
+    
+    if converted_count > 0:
+        logger.info(f"Converted 'step' from tensor to int for {converted_count} parameter states during checkpoint cleanup.")
+    else:
+        logger.debug("cleanup_bnb_step_tensors: No tensor steps found or conversion was not needed.") 

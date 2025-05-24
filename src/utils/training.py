@@ -17,7 +17,7 @@ import socket
 import re
 import random
 import contextlib # Added for nullcontext
-from .bnb_utils import ensure_bnb_state # Import the new utility
+from .bnb_utils import ensure_bnb_state, cleanup_bnb_step_tensors # Import the new utility
 
 logger = logging.getLogger(__name__)
 
@@ -383,48 +383,51 @@ class Trainer:
                     # Scale loss for gradient accumulation
                     loss = loss / self.gradient_accumulation_steps
                 
-                # Backward pass, optimizer step, and scaler update are now grouped and guarded
-                try:
+                # Backward pass is done first
+                if self.mixed_precision:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                # Optimizer step logic, only if it's an accumulation boundary
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                     if self.mixed_precision:
-                        self.scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-
-                    # Gradient accumulation step occurs here, before potential optimizer step
-                    if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                        self.scaler.unscale_(self.optimizer) # Unscale before clipping
+                    
+                    if self._has_nan_or_inf_grad_after_unscale(): # Checks grads after unscale (if MP) or just before clip (if not MP, though helper name implies unscale)
+                        logger.error(f"Skipping optimizer step for batch {batch_idx}, global step {self.global_step} due to non-finite gradients.")
+                        skipped_batches += 1
+                        self.optimizer.zero_grad(set_to_none=True) # Clear grads
+                        # If using scaler, it's important to call update to keep its state consistent, even if we skip a step.
+                        # This is because unscale_ was called. If step is skipped, update ensures scaler is ready for next valid step.
                         if self.mixed_precision:
-                            # Unscale before clipping, if using mixed precision
-                            self.scaler.unscale_(self.optimizer)
-                        
-                        if self._has_nan_or_inf_grad_after_unscale(): # Checks grads after unscale (if MP) or just before clip
-                            logger.error(f"Skipping optimizer step for batch {batch_idx} at global step {self.global_step} due to non-finite gradients.")
-                            skipped_batches += 1
-                            self.optimizer.zero_grad() 
-                            continue 
+                            self.scaler.update()
+                        continue # Move to next micro-batch, effectively skipping optimizer step and global_step increment
 
-                        if self.writer and self.config.log_grad_norm:
-                            unclipped_grad_norm = self._compute_grad_norm()
-                            self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
-                            if self.global_step % (self.config.log_every_n_steps * 5) == 0:
-                                self._log_layer_gradient_norms(self.global_step)
-                        
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        
-                        if self.writer and self.config.log_grad_norm:
-                            clipped_grad_norm = self._compute_grad_norm()
-                            self.writer.add_scalar('training/gradient_norm_post_clip', clipped_grad_norm, self.global_step)
-                            if unclipped_grad_norm > 0:
-                                clip_ratio = clipped_grad_norm / unclipped_grad_norm
-                                self.writer.add_scalar('training/gradient_clip_ratio', clip_ratio, self.global_step)
-                        
-                        # Optimizer step and scaler update (if MP)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                    # Log pre-clip gradient norm if enabled
+                    if self.writer and self.config.log_grad_norm:
+                        # Note: _compute_grad_norm is called after unscale (if MP) and before clip.
+                        unclipped_grad_norm = self._compute_grad_norm()
+                        self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
+                        if self.global_step % (self.config.log_every_n_steps * 5) == 0:
+                            self._log_layer_gradient_norms(self.global_step)
+
+                    try:
                         if self.mixed_precision:
                             self.scaler.step(self.optimizer)
-                            self.scaler.update() # scaler.update() must follow scaler.step()
+                            # self.scaler.update() is now after the try-except block
                         else:
                             self.optimizer.step()
                         
-                        # Scheduler step (if any)
+                        # If step was successful, update scaler and zero grads, etc.
+                        if self.mixed_precision:
+                            self.scaler.update()
+                        
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.global_step += 1
+                        
                         if self.scheduler is not None:
                             self.scheduler.step()
                             if self.writer:
@@ -433,37 +436,41 @@ class Trainer:
                         elif self.writer:
                             current_lr = self.optimizer.param_groups[0]['lr']
                             self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
-                        
-                        self.optimizer.zero_grad()
-                        self.global_step += 1
-                
-                except KeyError as e:
-                    if "'state1'" in str(e) and self.config.use_8bit_optimizer:
-                        logger.warning(
-                            f"BnB optimizer 'state1' missing during backward/step in Epoch {self.epoch}, Batch {batch_idx}, Global Step {self.global_step}. "
-                            f"Ensuring state and skipping this batch's optimizer step."
-                        )
-                        ensure_bnb_state(self.optimizer, device=self.device) # Attempt to fix optimizer state
-                        self.optimizer.zero_grad(set_to_none=True) # Clear potentially problematic grads
-                        if self.mixed_precision:
-                            # Ensure scaler is updated to maintain consistency if step() was skipped before update()
-                            # This is important because scaler.scale(loss).backward() might have happened.
-                            self.scaler.update() 
-                        skipped_batches += 1
-                        # Need to make sure we don't do an optimizer step if we are not on an accumulation step boundary
-                        # The continue here skips the rest of the current micro-batch processing logic.
-                        continue 
-                    else:
-                        logger.error(f"Unhandled KeyError during backward/optimizer step: {e}", exc_info=True)
-                        self.save_checkpoint(is_best=False) # Save before raising unknown KeyError
+
+                    except (KeyError, TypeError) as e:
+                        error_str = str(e).lower() # For easier checking
+                        if self.config.use_8bit_optimizer and ("'state1'" in error_str or "integer tensors of a single element can be converted to an index" in error_str or "step" in error_str):
+                            logger.warning(
+                                f"Optimizer state error ('{e}') during step in Epoch {self.epoch}, Batch {batch_idx}, Global Step {self.global_step}. "
+                                f"Ensuring BnB state and skipping this batch's optimizer update."
+                            )
+                            ensure_bnb_state(self.optimizer, device=self.device) # Attempt to fix optimizer state
+                            self.optimizer.zero_grad(set_to_none=True) # Clear potentially problematic grads
+                            if self.mixed_precision:
+                                # Scaler.step() might not have been called or failed. 
+                                # Call update() to ensure scaler's internal state is advanced.
+                                self.scaler.update() 
+                            skipped_batches += 1
+                            continue # Move to the next micro-batch, effectively skipping the optimizer step and global_step increment
+                        else:
+                            logger.error(f"Unhandled Optimizer/Scheduler Error ({type(e).__name__}): {e}. Global step {self.global_step}", exc_info=True)
+                            self.save_checkpoint(is_best=False)
+                            self._close_writer()
+                            raise
+                    except RuntimeError as e:
+                         # Catch other runtime errors from optimizer.step() or scaler operations
+                        logger.error(f"RuntimeError during optimizer step or scaler update: {e}. Global step {self.global_step}", exc_info=True)
+                        self.save_checkpoint(is_best=False)
                         self._close_writer()
                         raise
-                except RuntimeError as e:
-                    logger.error(f"RuntimeError during backward/optimizer step: {e}. Global step {self.global_step}", exc_info=True)
-                    self.save_checkpoint(is_best=False) # Save before raising unknown RuntimeError
-                    self._close_writer()
-                    raise
-                
+                    finally:
+                        # This ensures that even if we `continue` above due to a caught BnB error,
+                        # if it was NOT an accumulation step, gradients are cleared.
+                        # However, if it WAS an accumulation step and we skipped, zero_grad was already called.
+                        # The logic here is tricky. Let's simplify: zero_grad is handled if step succeeds or if BnB error occurs.
+                        # If other error, it's raised. If it *wasn't* an accumulation step, grads just accumulate.
+                        pass # zero_grad is handled within the success path or the BnB error path of an accumulation step.
+
                 # Update metrics
                 step_loss = loss.item() * self.gradient_accumulation_steps
                 step_losses.append(step_loss)
@@ -1161,6 +1168,8 @@ class Trainer:
             if self.config.use_8bit_optimizer:
                 logger.info("Ensuring bitsandbytes optimizer state is robustly initialized after loading checkpoint...")
                 ensure_bnb_state(self.optimizer, device=self.device)
+                logger.info("Cleaning up any tensor 'step' entries in bitsandbytes optimizer state...")
+                cleanup_bnb_step_tensors(self.optimizer)
 
             # Restore RNG states for reproducibility
             logger.info("Attempting to restore RNG states from checkpoint for reproducibility...")
