@@ -36,7 +36,7 @@ pretrain:
   # ---------- data ----------------------------------- #
   train_file:  "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
   eval_file:   "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
-  epochs:      4
+  epochs:      3 
   max_len:     512
 
   # ---------- batch / accumulation ------------------- #
