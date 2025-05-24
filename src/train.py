@@ -100,7 +100,8 @@ def find_most_recent_checkpoint(output_dir: str) -> Optional[str]:
     checkpoints_found.sort(key=lambda x: (x['step'], x['epoch']), reverse=True)
     
     most_recent = checkpoints_found[0]
-    logger.info(f"Found {len(checkpoints_found)} potential checkpoint(s) to resume from. Most recent by step is: {most_recent['filename']} (Step: {most_recent['step']}, Epoch: {most_recent['epoch' if most_recent['epoch'] != -1 else 'N/A'})")
+    epoch_str = most_recent['epoch'] if most_recent['epoch'] != -1 else 'N/A'
+    logger.info(f"Found {len(checkpoints_found)} potential checkpoint(s) to resume from. Most recent by step is: {most_recent['filename']} (Step: {most_recent['step']}, Epoch: {epoch_str})")
     return most_recent['path']
 
 def main():
