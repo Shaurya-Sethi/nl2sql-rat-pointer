@@ -298,6 +298,16 @@ def main():
         try:
             trainer.load_checkpoint(checkpoint_to_load)
             logger.info(f"Successfully resumed training state using checkpoint: {checkpoint_to_load}")
+            # Add these debug lines
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+            config_lr = model_config.learning_rate
+            logger.info(f"Learning Rate Check - Config: {config_lr}, Current: {current_lr}")
+            if current_lr != config_lr:
+                logger.warning(f"Learning rate from checkpoint ({current_lr}) differs from config ({config_lr})")
+                # Update the learning rate to match config
+                for param_group in trainer.optimizer.param_groups:
+                    param_group['lr'] = config_lr
+                logger.info(f"Updated learning rate to match config: {config_lr}")
         except Exception as e:
             logger.error(f"Failed to load checkpoint {checkpoint_to_load}: {e}. Training will start from scratch or from --pretrained_model if SFT.", exc_info=True)
             trainer.epoch = 0

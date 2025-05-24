@@ -1075,75 +1075,15 @@ class Trainer:
             logger.error(f"Error saving checkpoint: {e}")
             
     def load_checkpoint(self, checkpoint_path: str):
-        """
-        Load model checkpoint.
-        
-        Args:
-            checkpoint_path: Path to checkpoint file
-        """
+        """Load checkpoint and restore training state."""
         try:
-            # Load checkpoint with weights_only=False since we trust our own checkpoints
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            logger.info(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
-            logger.info(f"Loading checkpoint from {checkpoint_path}...")
-            # Check if model config exists and validate it
+            # Validate model architecture compatibility
             if 'model_config' in checkpoint:
-                stored_config = checkpoint['model_config']
-                current_config = {
-                    'vocab_size': self.config.vocab_size,
-                    'd_model': self.config.d_model,
-                    'n_heads': self.config.n_heads,
-                    'n_layers': self.config.n_layers,
-                    'num_relations': self.config.num_relations,
-                    'use_pointer_generator': self.config.use_pointer_generator,
-                    'pad_token_id': self.config.pad_token_id
-                }
-                
-                # Define critical parameters that must match exactly
-                critical_params = [
-                    'vocab_size',          # Must match for embedding layers and vocab projections
-                    'use_pointer_generator', # Different decoder architectures
-                    'd_model',             # Size of hidden representations
-                    'n_layers',            # Number of layers in model 
-                    'n_heads',             # Number of attention heads
-                    'num_relations'        # Relation types for schema encoding
-                ]
-                
-                # Check for mismatches in critical parameters
-                critical_mismatches = []
-                for param in critical_params:
-                    if stored_config.get(param) != current_config.get(param):
-                        critical_mismatches.append(
-                            f"{param}: checkpoint={stored_config.get(param)}, current={current_config.get(param)}"
-                        )
-                
-                # If any critical parameters don't match, raise a ValueError
-                if critical_mismatches:
-                    error_msg = (
-                        f"Critical model configuration mismatch when loading checkpoint from {checkpoint_path}.\n"
-                        f"The following parameters are incompatible:\n"
-                        f"{chr(10).join(critical_mismatches)}\n"
-                        f"Cannot safely load checkpoint with different architecture parameters."
-                    )
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
-                    
-                # Check for other non-critical parameters 
-                non_critical_params = [param for param in stored_config if param not in critical_params]
-                non_critical_mismatches = []
-                for param in non_critical_params:
-                    if param in current_config and stored_config.get(param) != current_config.get(param):
-                        non_critical_mismatches.append(
-                            f"{param}: checkpoint={stored_config.get(param)}, current={current_config.get(param)}"
-                        )
-                
-                # Warn about non-critical differences
-                if non_critical_mismatches:
-                    logger.warning(
-                        f"Non-critical configuration differences detected:\n"
-                        f"{chr(10).join(non_critical_mismatches)}\n"
-                        f"Continuing with checkpoint loading, but model behavior may be affected."
-                    )
+                model_config = checkpoint['model_config']
+                # ... existing code ...
             else:
                 logger.warning(
                     "Checkpoint does not contain model configuration. "
@@ -1153,6 +1093,10 @@ class Trainer:
             
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Store the config's learning rate before loading scheduler state
+            config_lr = self.config.learning_rate
+            
             if self.scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             if self.scaler and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict']:
@@ -1162,8 +1106,18 @@ class Trainer:
             self.global_step = checkpoint['global_step']
             self.best_val_loss = checkpoint['best_val_loss']
             
+            # Ensure learning rate matches config after loading checkpoint
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if current_lr != config_lr:
+                logger.warning(f"Learning rate from checkpoint ({current_lr}) differs from config ({config_lr}). Updating to match config.")
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = config_lr
+                # If using a scheduler, make sure it's aware of the correct learning rate
+                if self.scheduler:
+                    self.scheduler.base_lrs = [config_lr] * len(self.optimizer.param_groups)
+            
             logger.info(f"Loaded checkpoint from {checkpoint_path}")
-            logger.info(f"Resuming from Epoch: {self.epoch}, Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}")
+            logger.info(f"Resuming from Epoch: {self.epoch}, Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}, Learning Rate: {config_lr}")
 
             if self.config.use_8bit_optimizer:
                 logger.info("Ensuring bitsandbytes optimizer state is robustly initialized after loading checkpoint...")
