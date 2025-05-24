@@ -17,6 +17,7 @@ import socket
 import re
 import random
 import contextlib # Added for nullcontext
+from .bnb_utils import ensure_bnb_state # Import the new utility
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +283,10 @@ class Trainer:
         progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
         
         for batch_idx, batch in enumerate(progress_bar):
+            if batch_idx == 0 and self.config.use_8bit_optimizer:
+                logger.info(f"Epoch {self.epoch}: Ensuring BnB optimizer state at the start of the epoch (batch_idx 0)...")
+                ensure_bnb_state(self.optimizer, device=self.device)
+
             if batch is None:
                 logger.warning(f"Trainer.train_epoch: Epoch {self.epoch}, Batch index {batch_idx}: Received None batch from DataLoader. Skipping.")
                 skipped_batches += 1 # Ensure this variable is initialized if used for overall stats
@@ -378,70 +383,44 @@ class Trainer:
                     # Scale loss for gradient accumulation
                     loss = loss / self.gradient_accumulation_steps
                 
-                # Backward pass with mixed precision
-                if self.mixed_precision:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                # Check for NaN/Inf in gradients using the helper method
-                if self._has_nan_or_inf_grad(): # _has_nan_or_inf_grad logs specific parameter and global_step
-                    logger.error(f"Skipping batch {batch_idx} at global step {self.global_step} due to non-finite gradients.")
-                    skipped_batches += 1
-                    if self.optimizer: # Ensure optimizer exists
-                        self.optimizer.zero_grad()
-                    continue
-                
-                # Reset consecutive OOM counter since we got past the backward pass
-                consecutive_oom = 0
-                
-                # Calculate gradient norm for logging
-                if self.writer and self.config.log_grad_norm and (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    grad_norm = self._compute_grad_norm()
-                    grad_norms.append(grad_norm)
-                
-                # Update weights if we've accumulated enough gradients
-                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    # Gradient clipping and optimizer step are now less nested
-                    # The try-except for GradScaler unscale_() error is removed as per new plan
+                # Backward pass, optimizer step, and scaler update are now grouped and guarded
+                try:
+                    if self.mixed_precision:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
-                    if self.mixed_precision:
-                        # Unscale gradients before clipping
-                        # This call is kept, as it's standard practice before clipping if scaler is used.
-                        # If this itself errors, it would be a different issue than the state1 KeyError or double unscale.
-                        self.scaler.unscale_(self.optimizer)
-                    
-                    # Additional check for NaN/Inf after unscaling (if mixed precision)
-                    # or just before clipping (if not mixed precision)
-                    if self.mixed_precision:
-                        if self._has_nan_or_inf_grad_after_unscale(): # Renamed for clarity
-                            logger.error(f"Skipping optimizer step for batch {batch_idx} at global step {self.global_step} due to non-finite gradients after unscaling.")
+                    # Gradient accumulation step occurs here, before potential optimizer step
+                    if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                        if self.mixed_precision:
+                            # Unscale before clipping, if using mixed precision
+                            self.scaler.unscale_(self.optimizer)
+                        
+                        if self._has_nan_or_inf_grad_after_unscale(): # Checks grads after unscale (if MP) or just before clip
+                            logger.error(f"Skipping optimizer step for batch {batch_idx} at global step {self.global_step} due to non-finite gradients.")
                             skipped_batches += 1
-                            self.optimizer.zero_grad() # Clear grads
-                            # Scaler state should be okay as update() wasn't called with bad grads yet.
-                            continue # Move to next micro-batch
-                    
-                    # Calculate and log gradient norm before clipping
-                    if self.writer and self.config.log_grad_norm:
-                        unclipped_grad_norm = self._compute_grad_norm()
-                        self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
-                        if self.global_step % (self.config.log_every_n_steps * 5) == 0:
-                            self._log_layer_gradient_norms(self.global_step)
-                    
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    if self.writer and self.config.log_grad_norm:
-                        clipped_grad_norm = self._compute_grad_norm()
-                        self.writer.add_scalar('training/gradient_norm_post_clip', clipped_grad_norm, self.global_step)
-                        if unclipped_grad_norm > 0:
-                            clip_ratio = clipped_grad_norm / unclipped_grad_norm
-                            self.writer.add_scalar('training/gradient_clip_ratio', clip_ratio, self.global_step)
-                    
-                    # Optimizer step and scaler update
-                    try:
+                            self.optimizer.zero_grad() 
+                            continue 
+
+                        if self.writer and self.config.log_grad_norm:
+                            unclipped_grad_norm = self._compute_grad_norm()
+                            self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
+                            if self.global_step % (self.config.log_every_n_steps * 5) == 0:
+                                self._log_layer_gradient_norms(self.global_step)
+                        
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        
+                        if self.writer and self.config.log_grad_norm:
+                            clipped_grad_norm = self._compute_grad_norm()
+                            self.writer.add_scalar('training/gradient_norm_post_clip', clipped_grad_norm, self.global_step)
+                            if unclipped_grad_norm > 0:
+                                clip_ratio = clipped_grad_norm / unclipped_grad_norm
+                                self.writer.add_scalar('training/gradient_clip_ratio', clip_ratio, self.global_step)
+                        
+                        # Optimizer step and scaler update (if MP)
                         if self.mixed_precision:
                             self.scaler.step(self.optimizer)
-                            self.scaler.update()
+                            self.scaler.update() # scaler.update() must follow scaler.step()
                         else:
                             self.optimizer.step()
                         
@@ -457,30 +436,33 @@ class Trainer:
                         
                         self.optimizer.zero_grad()
                         self.global_step += 1
-
-                    except KeyError as e:
-                        if "state1" in str(e) and self.config.use_8bit_optimizer:
-                            logger.warning(
-                                f"Bitsandbytes optimizer missing 'state1' during step() in Epoch {self.epoch}, Batch {batch_idx}, Global Step {self.global_step}. "
-                                f"Attempting to re-initialise BnB state and skipping this batch."
-                            )
-                            self._ensure_bnb_state(self.optimizer) # Attempt to fix optimizer state
-                            self.optimizer.zero_grad(set_to_none=True) # Clear potentially problematic grads
-                            if self.mixed_precision:
-                                # Ensure scaler is updated to maintain consistency if step() was skipped before update()
-                                self.scaler.update()
-                            skipped_batches += 1
-                            continue # Move to the next micro-batch
-                        else:
-                            logger.error(f"KeyError during optimizer step/scheduler: {e}", exc_info=True)
-                            raise # Re-raise other KeyErrors
-                    except RuntimeError as e:
-                        # This catches other RuntimeErrors from optimizer.step() or scaler.step/update that are not KeyErrors
-                        # The specific "unscale_() has already been called" is less likely now.
-                        logger.error(f"RuntimeError during optimizer step or scaler update: {e}. Global step {self.global_step}", exc_info=True)
-                        # Potentially save checkpoint before raising, or try to recover if possible
-                        # For now, just re-raise to halt if it's not the BnB state key error
+                
+                except KeyError as e:
+                    if "'state1'" in str(e) and self.config.use_8bit_optimizer:
+                        logger.warning(
+                            f"BnB optimizer 'state1' missing during backward/step in Epoch {self.epoch}, Batch {batch_idx}, Global Step {self.global_step}. "
+                            f"Ensuring state and skipping this batch's optimizer step."
+                        )
+                        ensure_bnb_state(self.optimizer, device=self.device) # Attempt to fix optimizer state
+                        self.optimizer.zero_grad(set_to_none=True) # Clear potentially problematic grads
+                        if self.mixed_precision:
+                            # Ensure scaler is updated to maintain consistency if step() was skipped before update()
+                            # This is important because scaler.scale(loss).backward() might have happened.
+                            self.scaler.update() 
+                        skipped_batches += 1
+                        # Need to make sure we don't do an optimizer step if we are not on an accumulation step boundary
+                        # The continue here skips the rest of the current micro-batch processing logic.
+                        continue 
+                    else:
+                        logger.error(f"Unhandled KeyError during backward/optimizer step: {e}", exc_info=True)
+                        self.save_checkpoint(is_best=False) # Save before raising unknown KeyError
+                        self._close_writer()
                         raise
+                except RuntimeError as e:
+                    logger.error(f"RuntimeError during backward/optimizer step: {e}. Global step {self.global_step}", exc_info=True)
+                    self.save_checkpoint(is_best=False) # Save before raising unknown RuntimeError
+                    self._close_writer()
+                    raise
                 
                 # Update metrics
                 step_loss = loss.item() * self.gradient_accumulation_steps
@@ -1013,61 +995,6 @@ class Trainer:
                     return True
         return False
 
-    def _ensure_bnb_state(self, optimizer):
-        """Ensure every param in every group has state1/state2 for bitsandbytes optimizers."""
-        if not (self.config.use_8bit_optimizer and hasattr(optimizer, '_init_group')):
-            if self.config.use_8bit_optimizer:
-                logger.warning("Attempted to ensure BnB state, but optimizer does not have _init_group. Skipping.")
-            return
-
-        missing_params_explicitly_fixed = 0
-        for group_idx, group in enumerate(optimizer.param_groups):
-            # Call _init_group first, which should handle most cases correctly
-            # including dtype and device.
-            optimizer._init_group(group)
-            
-            # Explicitly check and create state1/state2 if still missing after _init_group
-            # This is a safeguard as requested.
-            for p_idx, p in enumerate(group["params"]):
-                if p not in optimizer.state:
-                    # This case should ideally be rare if _init_group works as expected
-                    # or if parameters are not changed after optimizer init.
-                    logger.warning(
-                        f"Param {p_idx} in group {group_idx} (LR: {group['lr']}) "
-                        f"still not in optimizer.state after _init_group. "
-                        f"This might indicate an issue with parameter tracking."
-                    )
-                    # Attempt to add the parameter to the state dictionary manually and then initialize
-                    optimizer.state[p] = {} # Create empty state for the param
-                    # Re-call _init_group for this specific group again, hoping it picks up the newly added p
-                    # This is a bit of a guess, as _init_group might expect all params to be known.
-                    optimizer._init_group(group)
-
-
-                # Now check for state1/state2
-                state = optimizer.state.get(p)
-                if state is None: # Should not happen if above logic is sound
-                    logger.error(f"Critical: Param {p_idx} in group {group_idx} has no state entry at all. Skipping explicit state creation.")
-                    continue
-
-                initialized_here = False
-                if "state1" not in state:
-                    state["state1"] = torch.zeros_like(p.data, dtype=torch.float32, device=p.device)
-                    initialized_here = True
-                if "state2" not in state:
-                    state["state2"] = torch.zeros_like(p.data, dtype=torch.float32, device=p.device)
-                    initialized_here = True
-                
-                if initialized_here:
-                    missing_params_explicitly_fixed += 1
-                    logger.debug(f"Explicitly initialised state1/state2 for param {p_idx} in group {group_idx} (LR: {group['lr']}).")
-
-        if missing_params_explicitly_fixed > 0:
-            logger.info(f"Initialised missing state1/state2 for {missing_params_explicitly_fixed} parameter(s) via explicit safeguard.")
-        else:
-            logger.info("BnB optimizer state check: all parameters appear to have state1/state2 after _init_group calls.")
-
-
     def save_checkpoint(self, is_best: bool = False):
         """
         Save model checkpoint.
@@ -1231,13 +1158,9 @@ class Trainer:
             logger.info(f"Loaded checkpoint from {checkpoint_path}")
             logger.info(f"Resuming from Epoch: {self.epoch}, Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}")
 
-            # Restore optimizer state for bitsandbytes if necessary
-            if self.config.use_8bit_optimizer and hasattr(self.optimizer, '_init_group'):
+            if self.config.use_8bit_optimizer:
                 logger.info("Ensuring bitsandbytes optimizer state is robustly initialized after loading checkpoint...")
-                self._ensure_bnb_state(self.optimizer)
-            elif self.config.use_8bit_optimizer:
-                logger.warning("Using 8-bit optimizer, but it does not have _init_group method. Cannot ensure optimizer state post-load.")
-
+                ensure_bnb_state(self.optimizer, device=self.device)
 
             # Restore RNG states for reproducibility
             logger.info("Attempting to restore RNG states from checkpoint for reproducibility...")
