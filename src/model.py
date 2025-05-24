@@ -191,12 +191,9 @@ class NL2SQLTransformer(nn.Module):
             logits = self.decoder(
                 tgt_ids=decoder_input_ids,
                 encoder_out=encoder_output,
-                tgt_mask=decoder_attention_mask,
-                tgt_key_padding_mask=decoder_key_padding_mask
-                # Standard TransformerDecoder takes memory_key_padding_mask in its forward, 
-                # but our current one doesn't explicitly. It might be implicitly handled or expected via memory_mask.
-                # For safety, if using the standard decoder, ensure it handles encoder padding if necessary.
-                # The original TransformerDecoder used in this codebase does accept memory_key_padding_mask.
+                tgt_mask=decoder_attention_mask, # This is the causal mask for decoder self-attention
+                tgt_key_padding_mask=decoder_key_padding_mask, # Padding for target sequence
+                memory_key_padding_mask=actual_memory_key_padding_mask # Padding for encoder sequence in cross-attention
             )
             
             return {
@@ -276,10 +273,15 @@ class NL2SQLTransformer(nn.Module):
                 # Get next token (greedy)
                 next_token = outputs[:, -1:, :].argmax(dim=-1)
             else:
+                # Standard decoder needs tgt_key_padding_mask for its self-attention if inputs are padded,
+                # and memory_key_padding_mask for cross-attention.
+                current_tgt_key_padding_mask = (decoder_input == self.pad_token_id)
                 outputs = self.decoder(
                     tgt_ids=decoder_input,
                     encoder_out=encoder_output,
-                    tgt_mask=causal_mask
+                    tgt_mask=causal_mask, # Causal mask for self-attention
+                    tgt_key_padding_mask=current_tgt_key_padding_mask, # Padding for current decoder input
+                    memory_key_padding_mask=memory_key_padding_mask # Padding for encoder output in cross-attention
                 )
                 # Get next token (greedy)
                 next_token = outputs[:, -1:, :].argmax(dim=-1)

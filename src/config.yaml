@@ -45,12 +45,12 @@ pretrain:
   max_batch_size:        16      # validation
 
   # ---------- optimisation --------------------------- #
-  learning_rate:   3.0e-5        # reduced from 1.0e-4 
+  learning_rate:   1.0e-6        # reduced from 1.0e-4 -> then from 3e-5
   scheduler:       cosine
   warmup_steps:    2500
   max_steps:       46875
   weight_decay:    0.01
-  max_grad_norm:   0.5
+  max_grad_norm:   0.3           # reduced from 0.5 -> more aggressive clipping for second epoch
 
   # ---------- runtime -------------------------------- #
   mixed_precision:        true     # fp16/ bf16 autocast

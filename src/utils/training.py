@@ -75,16 +75,42 @@ class Trainer:
         self.early_stopping_patience = early_stopping_patience
         self.mixed_precision = mixed_precision and torch.cuda.is_available()
         
+        # Apply phase-specific settings from config
+        self.gradient_accumulation_steps = self.config.gradient_accumulation_steps
+        self.max_grad_norm = self.config.max_grad_norm
+        if self.config.early_stopping_patience is not None:
+            self.early_stopping_patience = self.config.early_stopping_patience
+        self.mixed_precision = self.config.mixed_precision and torch.cuda.is_available()
+        
         # Ensure pad_token_id is 18 everywhere
         assert self.config.pad_token_id == 18, "pad_token_id must be 18 everywhere"
         
         # Initialize optimizer if not provided
         if optimizer is None:
-            self.optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay
-            )
+            # Determine optimizer type based on config
+            if self.config.use_8bit_optimizer:
+                try:
+                    from bitsandbytes.optim import AdamW8bit
+                    self.optimizer = AdamW8bit(
+                        model.parameters(),
+                        lr=self.config.learning_rate,
+                        weight_decay=self.config.weight_decay
+                    )
+                    logger.info("Using 8-bit AdamW optimizer.")
+                except ImportError:
+                    logger.warning("bitsandbytes not found, falling back to standard AdamW. "
+                                   "To use 8-bit optimizer, please install bitsandbytes.")
+                    self.optimizer = torch.optim.AdamW(
+                        model.parameters(),
+                        lr=self.config.learning_rate,
+                        weight_decay=self.config.weight_decay
+                    )
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=self.config.learning_rate,
+                    weight_decay=self.config.weight_decay
+                )
         else:
             self.optimizer = optimizer
             
@@ -1016,9 +1042,15 @@ class Trainer:
             output_dir.mkdir(parents=True, exist_ok=True)
             
             # Save regular checkpoint
-            checkpoint_path = output_dir / f'checkpoint-{self.global_step}.pt'
+            checkpoint_filename = f'checkpoint_epoch{self.epoch}_step{self.global_step}.pt'
+            checkpoint_path = output_dir / checkpoint_filename
             torch.save(checkpoint, checkpoint_path)
             logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+            # Save a copy as latest_checkpoint.pt for easy resumption
+            latest_checkpoint_path = output_dir / 'latest_checkpoint.pt'
+            torch.save(checkpoint, latest_checkpoint_path)
+            logger.info(f"Updated latest_checkpoint.pt to {checkpoint_filename}")
             
             # Save best model
             if is_best:
@@ -1045,6 +1077,7 @@ class Trainer:
             # Load checkpoint with weights_only=False since we trust our own checkpoints
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             
+            logger.info(f"Loading checkpoint from {checkpoint_path}...")
             # Check if model config exists and validate it
             if 'model_config' in checkpoint:
                 stored_config = checkpoint['model_config']
@@ -1122,6 +1155,7 @@ class Trainer:
             self.best_val_loss = checkpoint['best_val_loss']
             
             logger.info(f"Loaded checkpoint from {checkpoint_path}")
+            logger.info(f"Resuming from Epoch: {self.epoch}, Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}")
 
             # Restore RNG states for reproducibility
             logger.info("Attempting to restore RNG states from checkpoint for reproducibility...")
@@ -1160,63 +1194,11 @@ class Trainer:
         except Exception as e:
             logger.error(f"Error loading checkpoint: {e}", exc_info=True) # Added exc_info for better debugging
             raise
-            
-    def train(self, num_epochs: int):
-        """
-        Train model for specified number of epochs.
-        
-        Args:
-            num_epochs: Number of epochs to train for
-        """
-        try:
-            for epoch in range(num_epochs):
-                self.epoch = epoch
-                
-                # Train epoch
-                train_metrics = self.train_epoch()
-                logger.info(f"Epoch {epoch} - Train Loss: {train_metrics['train_loss']:.4f}")
-                
-                # Validate
-                if self.val_dataloader is not None:
-                    val_metrics = self.validate()
-                    logger.info(f"Epoch {epoch} - Val Loss: {val_metrics['val_loss']:.4f}")
-                    
-                    # Early stopping check - ensure loss is finite
-                    val_loss = val_metrics['val_loss']
-                    if torch.isfinite(torch.tensor(val_loss)) and val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                        self.save_checkpoint(is_best=True)
-                        self.no_improve_epochs = 0
-                    else:
-                        self.no_improve_epochs += 1
-                        if self.no_improve_epochs >= self.early_stopping_patience:
-                            logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                            break
-                        
-                # Save regular checkpoint
-                if (epoch + 1) % self.config.save_steps == 0:
-                    self.save_checkpoint()
-                
-                # Clear CUDA cache to reduce memory fragmentation
-                if torch.cuda.is_available():
-                    logger.info("Clearing CUDA cache to reduce memory fragmentation")
-                    torch.cuda.empty_cache()
-                    
-            # TensorBoard writer is now closed in the finally block
-                    
-        except KeyboardInterrupt:
-            logger.info("Training interrupted by user")
-            self.save_checkpoint()
-            # TensorBoard writer is now closed in the finally block
-            
-        except Exception as e:
-            logger.error(f"Error during training: {e}", exc_info=True) # Added exc_info for better debugging
-            self.save_checkpoint()
-            # TensorBoard writer is now closed in the finally block
-            raise
         finally:
             # Ensure TensorBoard writer is always closed
-            self._close_writer()
+            if self.writer is not None: # Check if writer exists before closing
+                logger.info("Ensuring TensorBoard writer is closed.")
+                self._close_writer()
             
     def _close_writer(self):
         """Close TensorBoard writer to ensure all logs are flushed."""

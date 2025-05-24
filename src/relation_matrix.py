@@ -2,7 +2,7 @@ import torch
 import logging
 from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
-import sentencepiece as spm
+from tokenizer import NL2SQLTokenizer
 import re  # Added for regex pattern validation
 
 logger = logging.getLogger(__name__)
@@ -37,47 +37,30 @@ class RelationMatrixBuilder:
     }
 
     def __init__(self,
-                 sp_model_path: str,
-                 special_tokens: Dict[str, str],   # pieces, e.g. '<PK>'
-                 num_relations: int = 5,
-                 phase_max_len: int = 1664):  # Added phase_max_len parameter with default
+                 tokenizer: NL2SQLTokenizer,
+                 num_relations: int = 5):
         """
         Initialize relation matrix builder.
         
         Args:
-            sp_model_path: Path to sentencepiece model
-            special_tokens: Dictionary of special token strings
+            tokenizer: NL2SQLTokenizer instance
             num_relations: Number of relation types
-            phase_max_len: Maximum allowed sequence length for relation matrix
         """
         try:
-            self.sp = spm.SentencePieceProcessor()
-            if not self.sp.load(sp_model_path):
-                raise ValueError(f"Failed to load SentencePiece model from {sp_model_path}")
+            self.sp = tokenizer.sp
+            self.tok_id = tokenizer.special_token_ids
 
-            # Validate special tokens
-            required_tokens = {
+            # Validate special tokens are present in the provided tokenizer's mapping
+            required_token_names = {
                 'SCHEMA_START', 'SCHEMA_END',
                 'PK_START', 'PK_END',
                 'FK_START', 'FK_END'
             }
-            missing_tokens = required_tokens - set(special_tokens.keys())
+            missing_tokens = required_token_names - set(self.tok_id.keys())
             if missing_tokens:
-                raise ValueError(f"Missing required special tokens: {missing_tokens}")
-
-            # Convert special-piece strings to their IDs
-            self.tok_id = {}
-            for k, v in special_tokens.items():
-                try:
-                    token_id = self.sp.piece_to_id(v)
-                    if token_id == self.sp.unk_id():
-                        raise ValueError(f"Special token '{k}' ({v}) maps to unknown token")
-                    self.tok_id[k] = token_id
-                except Exception as e:
-                    raise ValueError(f"Invalid special token '{k}' ({v}): {e}")
+                raise ValueError(f"Missing required special token names in tokenizer's special_token_ids: {missing_tokens}")
 
             self.num_relations = num_relations
-            self.phase_max_len = phase_max_len  # Store max length
             
             if num_relations < len(self._REL_MAP):
                 raise ValueError(f"num_relations={num_relations} must be at least {len(self._REL_MAP)}")
@@ -312,31 +295,35 @@ class RelationMatrixBuilder:
 
     def build_relation_matrix(self,
                             full_ids: List[int],
-                            schema_tokens: Optional[List[SchemaToken]] = None) -> torch.Tensor:
+                            schema_tokens: Optional[List[SchemaToken]] = None,
+                            max_seq_len_for_matrix: Optional[int] = None) -> torch.Tensor:
         """
         Build relation matrix from schema tokens.
         
         Args:
             full_ids: List of token IDs
             schema_tokens: Optional list of SchemaToken objects. If None, will be parsed.
+            max_seq_len_for_matrix: Optional maximum sequence length to enforce for the matrix.
+                                    If full_ids is longer, it will be truncated.
+                                    If None, uses the length of full_ids.
             
         Returns:
             Relation matrix tensor of shape (seq_len, seq_len)
         """
         try:
-            seq_len = len(full_ids)
+            current_full_ids = list(full_ids)
+
+            if max_seq_len_for_matrix is not None and len(current_full_ids) > max_seq_len_for_matrix:
+                logger.warning(f"RelationMatrixBuilder: input full_ids (len {len(current_full_ids)}) exceeds max_seq_len_for_matrix ({max_seq_len_for_matrix}). Truncating full_ids.")
+                current_full_ids = current_full_ids[:max_seq_len_for_matrix]
             
-            # Check if sequence length exceeds the maximum allowed length
-            if seq_len > self.phase_max_len:
-                error_msg = f"Relation matrix input too large: {seq_len} > {self.phase_max_len}"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-                
+            seq_len = len(current_full_ids)
+            
             rel = torch.zeros((seq_len, seq_len), dtype=torch.long)
 
-            # Parse schema tokens if not provided
+            # Parse schema tokens if not provided, using the (potentially truncated) current_full_ids
             if schema_tokens is None:
-                schema_tokens = self.parse_schema_tokens(full_ids)
+                schema_tokens = self.parse_schema_tokens(current_full_ids)
                 
             if not schema_tokens:
                 logger.warning("No schema tokens to build relation matrix, returning zero matrix")
@@ -420,12 +407,13 @@ class RelationMatrixBuilder:
             logger.error(f"Error building relation matrix: {e}")
             return torch.zeros((seq_len, seq_len), dtype=torch.long)
             
-    def build_matrix(self, schema: str) -> torch.Tensor:
+    def build_matrix(self, schema: str, max_seq_len_for_matrix: Optional[int] = None) -> torch.Tensor:
         """
         Convenience method to build relation matrix from schema string.
         
         Args:
             schema: Schema string
+            max_seq_len_for_matrix: Optional maximum sequence length for the matrix.
             
         Returns:
             Relation matrix tensor
@@ -442,15 +430,16 @@ class RelationMatrixBuilder:
                 logger.error("Schema encoding produced empty ID list")
                 return torch.zeros((1, 1), dtype=torch.long)
             
-            # Check if encoded schema length exceeds the maximum
-            if len(schema_ids) > self.phase_max_len:
-                error_msg = f"Schema too large: {len(schema_ids)} tokens > {self.phase_max_len} max_len"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
+            # Check if encoded schema length exceeds the maximum if provided
+            if max_seq_len_for_matrix is not None and len(schema_ids) > max_seq_len_for_matrix:
+                logger.warning(f"RelationMatrixBuilder.build_matrix: Encoded schema (len {len(schema_ids)}) exceeds max_seq_len_for_matrix ({max_seq_len_for_matrix}). Truncating schema_ids.")
+                schema_ids = schema_ids[:max_seq_len_for_matrix]
                 
             # Build relation matrix
-            return self.build_relation_matrix(schema_ids)
+            return self.build_relation_matrix(schema_ids, max_seq_len_for_matrix=max_seq_len_for_matrix)
             
         except Exception as e:
             logger.error(f"Error in build_matrix: {e}")
-            return torch.zeros((len(schema) if schema else 1, len(schema) if schema else 1), dtype=torch.long)
+            # Fallback based on original schema string length if schema_ids failed or max_seq_len is complex
+            fallback_len = max_seq_len_for_matrix if max_seq_len_for_matrix is not None else (len(schema) if schema else 1)
+            return torch.zeros((fallback_len, fallback_len), dtype=torch.long)
