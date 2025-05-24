@@ -18,6 +18,8 @@ from Pretraining_dataset import PretrainingDataset
 from SFT_dataset import SFTDataset
 import signal  # Added for signal handling
 import glob # For finding latest checkpoint
+import re # For parsing checkpoint filenames
+from typing import Optional
 
 # Set up logging
 logging.basicConfig(
@@ -42,6 +44,64 @@ def handle_signal(signum, frame):
 def worker_init_fn(worker_id):
     """Makes worker processes ignore SIGINT. Main process will handle it."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+def find_most_recent_checkpoint(output_dir: str) -> Optional[str]:
+    """Scans the output directory for checkpoints and returns the path to the most recent one based on step number."""
+    logger.info(f"Scanning for most recent checkpoint in {output_dir} (excluding latest_checkpoint.pt and best_model.pt)...")
+    checkpoints_found = []
+
+    # Pattern for current format: checkpoint_epoch{E}_step{S}.pt
+    pattern_epoch_step = re.compile(r"checkpoint_epoch(\d+)_step(\d+)\.pt")
+    # Pattern for older format: checkpoint-{S}.pt (like checkpoint-217193.pt)
+    pattern_step_only = re.compile(r"checkpoint-(\d+)\.pt")
+
+    # Combine glob patterns to find potential checkpoint files
+    candidate_files = glob.glob(os.path.join(output_dir, "checkpoint_epoch*_step*.pt")) + \
+                      glob.glob(os.path.join(output_dir, "checkpoint-*.pt"))
+
+    for ckpt_file_path in candidate_files:
+        filename = os.path.basename(ckpt_file_path)
+        
+        # Explicitly skip best_model.pt and latest_checkpoint.pt from this scan
+        if filename == "latest_checkpoint.pt" or filename == "best_model.pt":
+            continue
+
+        epoch = -1 # Default if not found in filename
+        step = -1
+
+        match_epoch_step = pattern_epoch_step.match(filename)
+        if match_epoch_step:
+            try:
+                epoch = int(match_epoch_step.group(1))
+                step = int(match_epoch_step.group(2))
+            except ValueError:
+                logger.warning(f"Could not parse epoch/step from {filename}. Skipping.")
+                continue
+        else:
+            match_step_only = pattern_step_only.match(filename)
+            if match_step_only:
+                try:
+                    step = int(match_step_only.group(1))
+                except ValueError:
+                    logger.warning(f"Could not parse step from {filename}. Skipping.")
+                    continue
+            else:
+                # This file doesn't match known resume-specific checkpoint patterns
+                continue 
+        
+        if step != -1:
+            checkpoints_found.append({'path': ckpt_file_path, 'epoch': epoch, 'step': step, 'filename': filename})
+
+    if not checkpoints_found:
+        logger.info("No suitable checkpoint files (e.g., checkpoint_epoch*_step*.pt or checkpoint-*.pt) found for automatic resumption.")
+        return None
+
+    # Sort by step number (descending), then by epoch number (descending) as a tie-breaker
+    checkpoints_found.sort(key=lambda x: (x['step'], x['epoch']), reverse=True)
+    
+    most_recent = checkpoints_found[0]
+    logger.info(f"Found {len(checkpoints_found)} potential checkpoint(s) to resume from. Most recent by step is: {most_recent['filename']} (Step: {most_recent['step']}, Epoch: {most_recent['epoch' if most_recent['epoch'] != -1 else 'N/A'})")
+    return most_recent['path']
 
 def main():
     global global_trainer, training_interrupted  # Add the global flag to main scope
@@ -215,8 +275,7 @@ def main():
             checkpoint_to_load = args.resume_from_checkpoint
             logger.info(f"Attempting to resume from specified checkpoint: {checkpoint_to_load}")
         else:
-            logger.warning(f"Specified resume_from_checkpoint not found: {args.resume_from_checkpoint}. Will check for latest_checkpoint.pt or start fresh.")
-            args.resume_from_checkpoint = None # Clear it so we try latest
+            logger.warning(f"Specified resume_from_checkpoint not found: {args.resume_from_checkpoint}. Will check for latest_checkpoint.pt or other checkpoints.")
 
     if not checkpoint_to_load:
         latest_checkpoint_path = Path(model_config.output_dir) / 'latest_checkpoint.pt'
@@ -224,24 +283,34 @@ def main():
             checkpoint_to_load = str(latest_checkpoint_path)
             logger.info(f"Found latest_checkpoint.pt. Attempting to resume from: {checkpoint_to_load}")
         else:
-            logger.info(f"No latest_checkpoint.pt found in {model_config.output_dir}. Will check for SFT pretrained model or start fresh.")
+            logger.info(f"No latest_checkpoint.pt found in {model_config.output_dir}. Scanning for most recent step-based checkpoint...")
+            # Call the new helper function to find the most recent checkpoint by step number
+            most_recent_ckpt_path = find_most_recent_checkpoint(model_config.output_dir)
+            if most_recent_ckpt_path:
+                checkpoint_to_load = most_recent_ckpt_path
+                # Log will be done by find_most_recent_checkpoint for which one it selected
+            else:
+                logger.info(f"No other resume-suitable checkpoints (e.g., checkpoint_epoch*_step*.pt or checkpoint-*.pt) found in {model_config.output_dir}.")
 
     if checkpoint_to_load:
         try:
             trainer.load_checkpoint(checkpoint_to_load)
-            logger.info(f"Successfully resumed training from checkpoint: {checkpoint_to_load}")
+            logger.info(f"Successfully resumed training state using checkpoint: {checkpoint_to_load}")
         except Exception as e:
-            logger.error(f"Failed to load checkpoint {checkpoint_to_load}: {e}. Training will start from scratch or from --pretrained_model if SFT.")
-            # Reset trainer's epoch and global_step if loading failed mid-way
+            logger.error(f"Failed to load checkpoint {checkpoint_to_load}: {e}. Training will start from scratch or from --pretrained_model if SFT.", exc_info=True)
             trainer.epoch = 0
             trainer.global_step = 0
             trainer.best_val_loss = float('inf')
-            # Re-initialize scheduler if checkpoint load failed and might have partially set it
+            trainer.no_improve_epochs = 0 # Reset this as well
+            # Re-initialize scheduler as checkpoint loading might have affected it or its optimizer reference
+            if trainer.optimizer is None: # Should have been created in Trainer.__init__
+                 raise ValueError("Trainer optimizer is None after failed checkpoint load attempt.")
             trainer.scheduler = get_cosine_schedule_with_warmup(
-                trainer.optimizer, # Optimizer should be fresh from model
+                trainer.optimizer,
                 num_warmup_steps=model_config.warmup_steps,
                 num_training_steps=model_config.max_steps
             )
+            logger.info("Reinitialized scheduler after failed checkpoint load.")
     elif args.phase == 'sft' and args.pretrained_model:
         # This case is for starting SFT from a --pretrained_model (e.g. from pretraining phase),
         # NOT for resuming an SFT run. Resuming SFT is handled by latest_checkpoint.pt or --resume_from_checkpoint.
