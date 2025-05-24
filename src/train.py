@@ -339,6 +339,11 @@ def main():
     else:
         logger.info(f"No checkpoint found to resume from, and not SFT with --pretrained_model. Starting {args.phase} training from scratch.")
 
+    # Ensure BnB optimizer state is initialized robustly, especially after checkpoint load or model manipulation
+    if model_config.use_8bit_optimizer and hasattr(trainer.optimizer, '_init_group'):
+        logger.info("Performing initial robust check and initialization of bitsandbytes optimizer state before training loop...")
+        trainer._ensure_bnb_state(trainer.optimizer)
+
     logger.info(f"Starting {args.phase} training. Will train for a total of {model_config.epochs} epochs.")
     logger.info(f"Initial state: Epoch {trainer.epoch}, Global Step {trainer.global_step}, Best Val Loss {trainer.best_val_loss:.4f}")
     logger.info(f"Max steps for LR scheduler remains: {model_config.max_steps}") # Clarify max_steps is for scheduler
