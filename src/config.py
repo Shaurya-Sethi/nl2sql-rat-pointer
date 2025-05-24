@@ -25,7 +25,7 @@ class NL2SQLConfig:
     - The schema parser in relation_matrix.py expects a specific format for schema tokens.
     - If schema parsing fails, the system will fall back to heuristic approaches, but quality may degrade.
     """
-    # Model architecture
+    # Model architecture (non-default)
     vocab_size: int
     d_model: int
     n_heads: int
@@ -33,54 +33,53 @@ class NL2SQLConfig:
     num_relations: int
     dropout: float
     max_len: int
-    use_pointer_generator: bool  # Whether to use pointer-generator for copying schema tokens
-    
-    # Tokenizer
+    use_pointer_generator: bool
+
+    # Tokenizer (non-default)
     special_tokens: Dict[str, str]
     
-    # Training (will be set based on phase)
+    # Training - core parameters (non-default, set from phase config)
     batch_size: int
-    max_batch_size: int
+    max_batch_size: int # Max batch size for evaluation/inference
     learning_rate: float
     weight_decay: float
     warmup_steps: int
-    max_steps: int
+    max_steps: int # Total training steps for LR scheduler
     gradient_accumulation_steps: int
     max_grad_norm: float
-    early_stopping_patience: Optional[int]
-    save_steps: int
+    early_stopping_patience: Optional[int] # Can be None if not used, but value comes from phase config
+    save_steps: int # Save checkpoint every N steps
     num_workers: int
     mixed_precision: bool
     use_8bit_optimizer: bool
-    use_bf16: bool
+    use_bf16: bool # Specific to mixed_precision
     gradient_checkpointing: bool
-    
-    # Paths
+    epochs: int # Total number of epochs for training
+
+    # Paths (non-default)
     sp_model_path: str
     output_dir: str
-    
     train_file: str
     eval_file: str
     
-    # TensorBoard logging
-    tensorboard_log_dir: Optional[str] = None  # Directory for TensorBoard logs, e.g., 'runs/exp1'
-    log_every_n_steps: int = 10  # Log training metrics every N steps
-    log_grad_norm: bool = True   # Whether to log gradient norms
-    log_grad_histogram: bool = False  # Whether to log parameter histograms (more expensive)
-    log_memory: bool = True  # Log GPU memory usage (if available)
-    
-    # Total number of epochs for training
-    epochs: int
-    
     # Parameters with default values
+    # TensorBoard logging (defaults provided)
+    tensorboard_log_dir: Optional[str] = None
+    log_every_n_steps: int = 10
+    log_grad_norm: bool = True
+    log_grad_histogram: bool = False
+    log_memory: bool = True
+    
+    # Tokenizer/model fixed values (defaults provided)
     pad_token_id: int = 18
     
-    # Phase-specific parameters
-    # This phase_max_len is for the current phase's dataset item length (e.g. pretrain can use 512)
+    # Phase-specific length parameters (defaults provided, can be overridden by phase config)
+    # Max length for items in the current phase's dataset (e.g., pretrain can use 512)
     dataset_phase_max_len: Optional[int] = None 
-    # This phase_max_len_pg is specifically for SFT pointer-generator's source (schema+NL) part
+    # Max length for SFT pointer-generator's source (schema+NL) part
     phase_max_len_pg: Optional[int] = None 
-    max_sql_len: Optional[int] = None    # Expected max length for SQL part in SFT (for clarity/logging)
+    # Expected max length for SQL part in SFT (for clarity/logging)
+    max_sql_len: Optional[int] = None
     
     @classmethod
     def from_yaml(cls, yaml_path: str, phase: str = 'sft'):
