@@ -1069,11 +1069,6 @@ class Trainer:
             checkpoint_path: Path to checkpoint file
         """
         try:
-            # Add NL2SQLConfig to safe globals
-            import torch.serialization
-            from config import NL2SQLConfig
-            torch.serialization.add_safe_globals([NL2SQLConfig])
-            
             # Load checkpoint with weights_only=False since we trust our own checkpoints
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             
