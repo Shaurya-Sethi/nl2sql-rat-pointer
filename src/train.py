@@ -90,12 +90,10 @@ def main():
         logger.error(f"Failed to load tokenizer: {e}")
         sys.exit(1)
 
-    # Initialize relation matrix builder
+    # Initialize relation matrix builder (only relevant for SFT but init anyway for consistency)
     relation_builder = RelationMatrixBuilder(
-        sp_model_path=model_config.sp_model_path,
-        special_tokens=model_config.special_tokens,
-        num_relations=model_config.num_relations,
-        phase_max_len=model_config.phase_max_len if hasattr(model_config, 'phase_max_len') else 1664
+        tokenizer=tokenizer,
+        num_relations=model_config.num_relations
     )
 
     # Initialize model
