@@ -69,6 +69,9 @@ class NL2SQLConfig:
     log_grad_histogram: bool = False  # Whether to log parameter histograms (more expensive)
     log_memory: bool = True  # Log GPU memory usage (if available)
     
+    # Total number of epochs for training
+    epochs: int
+    
     # Parameters with default values
     pad_token_id: int = 18
     
@@ -124,7 +127,7 @@ class NL2SQLConfig:
             'micro_batch_size', 'max_batch_size', 'learning_rate', 'weight_decay',
             'warmup_steps', 'max_steps', 'gradient_accumulation', 'max_grad_norm',
             'early_stopping_patience', 'save_steps', 'num_workers', 'mixed_precision',
-            'use_8bit_optimizer', 'bf16', 'gradient_checkpointing'
+            'use_8bit_optimizer', 'bf16', 'gradient_checkpointing', 'epochs'
         ]
         missing_fields = [f for f in required_phase_fields if f not in phase_config]
         if missing_fields:
@@ -172,6 +175,9 @@ class NL2SQLConfig:
             log_grad_norm=config_dict['logging'].get('log_grad_norm', True),
             log_grad_histogram=config_dict['logging'].get('log_grad_histogram', False),
             log_memory=config_dict['logging'].get('log_memory', True),
+            
+            # Total Epochs
+            epochs=phase_config['epochs'],
             
             # Phase-specific parameters
             # This phase_max_len is for the current phase's dataset item length (e.g. pretrain can use 512)
@@ -291,6 +297,7 @@ class NL2SQLConfig:
         assert self.max_grad_norm > 0, "max_grad_norm must be positive"
         assert self.save_steps > 0, "save_steps must be positive"
         assert self.num_workers >= 0, "num_workers must be non-negative"
+        assert self.epochs > 0, "epochs must be positive"
         
         # Required special tokens
         required_tokens = [

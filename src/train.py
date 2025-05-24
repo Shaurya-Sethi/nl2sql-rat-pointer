@@ -268,6 +268,7 @@ def main():
     num_epochs_for_max_steps = (model_config.max_steps + steps_per_epoch -1) // steps_per_epoch 
 
     logger.info(f"Calculated num_epochs based on max_steps: {num_epochs_for_max_steps}")
+    logger.info(f"Target total epochs for this run: {model_config.epochs}") # New log for total epochs
     
     # Checkpoint loading / Resumption logic
     checkpoint_to_load = None
@@ -338,16 +339,20 @@ def main():
     else:
         logger.info(f"No checkpoint found to resume from, and not SFT with --pretrained_model. Starting {args.phase} training from scratch.")
 
-    logger.info(f"Starting {args.phase} training. Will train until global_step reaches {model_config.max_steps}.")
+    logger.info(f"Starting {args.phase} training. Will train for a total of {model_config.epochs} epochs.")
     logger.info(f"Initial state: Epoch {trainer.epoch}, Global Step {trainer.global_step}, Best Val Loss {trainer.best_val_loss:.4f}")
+    logger.info(f"Max steps for LR scheduler remains: {model_config.max_steps}") # Clarify max_steps is for scheduler
+
+    start_epoch = trainer.epoch # Get start_epoch from trainer, which is 0 or loaded from checkpoint
 
     try:
-        while trainer.global_step < model_config.max_steps:
+        for current_epoch in range(start_epoch, model_config.epochs):
+            trainer.epoch = current_epoch # Set trainer's current epoch
             if training_interrupted:
                 logger.info("Training interruption flag checked at start of epoch. Breaking loop.")
                 break
 
-            logger.info(f"Starting Epoch {trainer.epoch} (Global Step: {trainer.global_step}/{model_config.max_steps})")
+            logger.info(f"Starting Epoch {trainer.epoch + 1}/{model_config.epochs} (Global Step: {trainer.global_step}) | Max steps for LR scheduler: {model_config.max_steps}")
             
             # Train one epoch (train_epoch now manages its own progress bar and step increments)
             train_metrics = trainer.train_epoch() # This will iterate through train_loader
@@ -403,15 +408,15 @@ def main():
                 logger.debug("Clearing CUDA cache to potentially reduce memory fragmentation.")
                 torch.cuda.empty_cache()
             
-            trainer.epoch += 1 # Increment epoch counter AFTER a full pass (train + val)
+            # trainer.epoch += 1 # Increment epoch counter AFTER a full pass (train + val) - REMOVED, epoch is managed by the loop
 
         # End of training loop (either completed max_steps or interrupted)
         if training_interrupted:
             logger.info("Training loop exited due to interruption signal.")
-        elif trainer.global_step >= model_config.max_steps:
-            logger.info(f"Training completed: global_step ({trainer.global_step}) reached max_steps ({model_config.max_steps}).")
+        elif trainer.epoch >= model_config.epochs -1: # Check if all epochs are completed
+            logger.info(f"Training completed: {trainer.epoch + 1}/{model_config.epochs} epochs finished. Final global_step: {trainer.global_step}")
         else:
-            logger.info("Training loop exited for an unexpected reason.")
+            logger.info("Training loop exited for an unexpected reason before completing all epochs.")
 
     except KeyboardInterrupt: # Should be caught by signal handler, but as a fallback
         logger.info("KeyboardInterrupt caught directly in main loop. Setting interrupt flag.")
