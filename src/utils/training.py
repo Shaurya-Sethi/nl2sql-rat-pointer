@@ -402,69 +402,86 @@ class Trainer:
                 
                 # Update weights if we've accumulated enough gradients
                 if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    if self.mixed_precision:
-                        self.scaler.unscale_(self.optimizer)
-                    
-                    # Additional check for NaN/Inf after unscaling
-                    if self.mixed_precision:
-                        has_nan_or_inf_grad = False
-                        for name, param in self.model.named_parameters():
-                            if param.grad is not None:
-                                if not torch.isfinite(param.grad).all():
-                                    logger.error(f"Non-finite gradient detected after unscaling in {name}, skipping")
-                                    has_nan_or_inf_grad = True
-                                    break
+                    try:
+                        # Gradient clipping
+                        if self.mixed_precision:
+                            self.scaler.unscale_(self.optimizer)
                         
-                        if has_nan_or_inf_grad:
-                            # Skip this batch due to bad gradients after unscaling
-                            skipped_batches += 1
-                            self.optimizer.zero_grad()
-                            continue
-                    
-                    # Calculate and log gradient norm before clipping
-                    if self.writer and self.config.log_grad_norm:
-                        unclipped_grad_norm = self._compute_grad_norm()
-                        self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
+                        # Additional check for NaN/Inf after unscaling
+                        if self.mixed_precision:
+                            has_nan_or_inf_grad = False
+                            for name, param in self.model.named_parameters():
+                                if param.grad is not None:
+                                    if not torch.isfinite(param.grad).all():
+                                        logger.error(f"Non-finite gradient detected after unscaling in {name}, skipping optimizer step for this batch.")
+                                        has_nan_or_inf_grad = True
+                                        break
+                            
+                            if has_nan_or_inf_grad:
+                                # Skip this batch due to bad gradients after unscaling
+                                skipped_batches += 1
+                                self.optimizer.zero_grad() # Clear grads anyway
+                                continue # Continue to next micro-batch, effectively skipping optimizer step
                         
-                        # Log per-layer gradient norms for more detailed monitoring
-                        if self.global_step % (self.config.log_every_n_steps * 5) == 0:
-                            self._log_layer_gradient_norms(self.global_step)
-                    
-                    # Apply gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    # Log gradient norm after clipping
-                    if self.writer and self.config.log_grad_norm:
-                        clipped_grad_norm = self._compute_grad_norm()
-                        self.writer.add_scalar('training/gradient_norm_post_clip', clipped_grad_norm, self.global_step)
+                        # Calculate and log gradient norm before clipping
+                        if self.writer and self.config.log_grad_norm:
+                            unclipped_grad_norm = self._compute_grad_norm()
+                            self.writer.add_scalar('training/gradient_norm_pre_clip', unclipped_grad_norm, self.global_step)
+                            
+                            # Log per-layer gradient norms for more detailed monitoring
+                            if self.global_step % (self.config.log_every_n_steps * 5) == 0:
+                                self._log_layer_gradient_norms(self.global_step)
                         
-                        # Log gradient clipping ratio
-                        if unclipped_grad_norm > 0:
-                            clip_ratio = clipped_grad_norm / unclipped_grad_norm
-                            self.writer.add_scalar('training/gradient_clip_ratio', clip_ratio, self.global_step)
-                    
-                    # Optimizer step
-                    if self.mixed_precision:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        self.optimizer.step()
+                        # Apply gradient clipping
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         
-                    if self.scheduler is not None:
-                        self.scheduler.step()
+                        # Log gradient norm after clipping
+                        if self.writer and self.config.log_grad_norm:
+                            clipped_grad_norm = self._compute_grad_norm()
+                            self.writer.add_scalar('training/gradient_norm_post_clip', clipped_grad_norm, self.global_step)
+                            
+                            # Log gradient clipping ratio
+                            if unclipped_grad_norm > 0:
+                                clip_ratio = clipped_grad_norm / unclipped_grad_norm
+                                self.writer.add_scalar('training/gradient_clip_ratio', clip_ratio, self.global_step)
                         
-                        # Log learning rate
-                        if self.writer:
-                            current_lr = self.scheduler.get_last_lr()[0]
+                        # Optimizer step
+                        if self.mixed_precision:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
+                            
+                        if self.scheduler is not None:
+                            self.scheduler.step()
+                            
+                            # Log learning rate
+                            if self.writer:
+                                current_lr = self.scheduler.get_last_lr()[0]
+                                self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
+                        elif self.writer:
+                            # Log learning rate if no scheduler
+                            current_lr = self.optimizer.param_groups[0]['lr']
                             self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
-                    elif self.writer:
-                        # Log learning rate if no scheduler
-                        current_lr = self.optimizer.param_groups[0]['lr']
-                        self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
-                    
-                    self.optimizer.zero_grad()
-                    self.global_step += 1
+                        
+                        self.optimizer.zero_grad()
+                        self.global_step += 1
+
+                    except RuntimeError as e:
+                        if self.mixed_precision and "unscale_() has already been called" in str(e):
+                            logger.warning(
+                                f"GradScaler state mismatch (unscale_ already called) in Epoch {self.epoch}, Batch {batch_idx}, Global Step {self.global_step}. "
+                                f"Skipping optimizer step for this batch and calling scaler.update() to sync."
+                            )
+                            # scaler.update() is crucial here to advance its internal state for the next valid step
+                            self.scaler.update()
+                            # We need to clear gradients as the optimizer step was skipped
+                            self.optimizer.zero_grad()
+                            skipped_batches += 1 # Count as a skipped batch
+                            continue # Move to the next micro-batch
+                        else:
+                            logger.error(f"RuntimeError during optimizer step: {e}", exc_info=True)
+                            raise # Re-raise other RuntimeErrors
                 
                 # Update metrics
                 step_loss = loss.item() * self.gradient_accumulation_steps
@@ -1151,6 +1168,38 @@ class Trainer:
             
             logger.info(f"Loaded checkpoint from {checkpoint_path}")
             logger.info(f"Resuming from Epoch: {self.epoch}, Global Step: {self.global_step}, Best Val Loss: {self.best_val_loss:.4f}")
+
+            # Restore optimizer state for bitsandbytes if necessary
+            if self.config.use_8bit_optimizer and hasattr(self.optimizer, '_init_group'):
+                initialized_params_count = 0
+                for group in self.optimizer.param_groups:
+                    params_in_group_requiring_init = []
+                    for p_id, p in enumerate(group['params']):
+                        if p not in self.optimizer.state:
+                            # This param was likely added after optimizer creation and before loading state dict,
+                            # or state was somehow missing. Common in complex distributed setups or model modifications.
+                            logger.warning(f"Parameter {p_id} in group (LR: {group['lr']}) was not found in optimizer state. Adding it to init list.")
+                            params_in_group_requiring_init.append(p)
+                        else:
+                            state = self.optimizer.state[p]
+                            # Bitsandbytes optimizers use 'state1' (EMA) and 'state2' (Variance)
+                            if 'state1' not in state or 'state2' not in state:
+                                params_in_group_requiring_init.append(p)
+                    
+                    if params_in_group_requiring_init:
+                        logger.info(
+                            f"Optimizer group (LR: {group['lr']}) has {len(params_in_group_requiring_init)} params "
+                            f"missing state1/state2. Calling _init_group for this group."
+                        )
+                        self.optimizer._init_group(group) # Re-initialize state for the whole group
+                        initialized_params_count += len(params_in_group_requiring_init)
+                
+                if initialized_params_count > 0:
+                    logger.info(f"Initialised missing BnB optimizer state for {initialized_params_count} params after resume.")
+            else:
+                if self.config.use_8bit_optimizer and not hasattr(self.optimizer, '_init_group'):
+                    logger.warning("Using 8-bit optimizer, but it does not have _init_group method. Cannot ensure optimizer state.")
+
 
             # Restore RNG states for reproducibility
             logger.info("Attempting to restore RNG states from checkpoint for reproducibility...")
