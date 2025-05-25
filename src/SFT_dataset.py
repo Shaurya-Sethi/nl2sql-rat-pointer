@@ -16,6 +16,7 @@ class SFTDataset(Dataset):
     """
     
     _source_truncation_warning_logged = False # Static class variable for one-time warning
+    _first_sample_globally_logged = False  # Class variable for one-time verification logging
     
     def __init__(self, data_file: str, tokenizer: NL2SQLTokenizer, 
                  relation_builder: RelationMatrixBuilder, 
@@ -48,7 +49,7 @@ class SFTDataset(Dataset):
 
         self.min_len = 4 # SFT rule: len < 4 is too short
         
-        self.sql_start_token_id = self.tokenizer.get_special_token_id('SQL_START')
+        self.cot_start_token_id = self.tokenizer.get_special_token_id('COT_START')
         self.sql_end_token_id = self.tokenizer.get_special_token_id('SQL_END')
         
         # For SFT truncation, we want to preserve SQL_END if it's the last token.
@@ -147,7 +148,29 @@ class SFTDataset(Dataset):
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
 
-        # 5. Rule: Too long (SFT > max_len (2048))
+        # 5. Find COT_START and SQL_END tokens for splitting encoder input and decoder target
+        try:
+            cot_start_index = token_ids.index(self.cot_start_token_id)
+        except ValueError:
+            logger.warning(f"SFTDataset [EX {idx}]: COT_START token not found. Dropping sample.")
+            self.dropped_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+            return None
+
+        # Find the last SQL_END that appears after COT_START
+        sql_end_indices = [i for i, token in enumerate(token_ids) if token == self.sql_end_token_id and i > cot_start_index]
+        if not sql_end_indices:
+            logger.warning(f"SFTDataset [EX {idx}]: No SQL_END token found after COT_START. Dropping sample.")
+            self.dropped_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+            return None
+        sql_end_index = sql_end_indices[-1]  # Take the last occurrence
+
+        # Split into encoder input and decoder target
+        raw_encoder_input_tokens = token_ids[:cot_start_index]  # Up to but not including COT_START
+        raw_target_tokens = token_ids[cot_start_index:sql_end_index + 1]  # From COT_START through SQL_END
+
+        # 6. Rule: Too long (SFT > max_len (2048))
         if len(token_ids) > self.max_len:
             self.truncated_count += 1
             # self._log_counts_summary_if_needed(dataset_name="SFTDataset") # Logged in __len__ or by interval
@@ -216,6 +239,16 @@ class SFTDataset(Dataset):
             except Exception as e:
                 logger.error(f"SFTDataset [EX {idx}]: Error building relation matrix/schema mask: {e}", exc_info=True)
         
+        # Verify first sample globally (for debugging)
+        if not SFTDataset._first_sample_globally_logged:
+            try:
+                logger.info("\nFirst sample verification:")
+                logger.info(f"Encoder input (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
+                logger.info(f"Decoder target (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
+                SFTDataset._first_sample_globally_logged = True
+            except Exception as e:
+                logger.error(f"Error logging first sample: {e}")
+
         return {
             'encoder_input': input_ids,
             'decoder_target': labels,

@@ -209,15 +209,13 @@ def main():
             data_file=model_config.train_file,
             tokenizer=tokenizer,
             relation_builder=relation_builder,
-            max_len=dataset_max_len,
-            pad_token_id=model_config.pad_token_id
+            config=model_config  # Pass the full config object
         )
         eval_dataset = SFTDataset(
             data_file=model_config.eval_file,
             tokenizer=tokenizer,
             relation_builder=relation_builder,
-            max_len=dataset_max_len,
-            pad_token_id=model_config.pad_token_id
+            config=model_config  # Pass the full config object
         )
         collate_fn_to_use = lambda batch: SFTDataset.collate_fn(batch, pad_id=model_config.pad_token_id)
 

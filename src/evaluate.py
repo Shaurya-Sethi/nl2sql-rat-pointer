@@ -237,8 +237,7 @@ def evaluate_model(model_checkpoint_path: str, config_path: str):
             data_file=config.eval_file,
             tokenizer=tokenizer,
             relation_builder=relation_builder,
-            max_len=config.max_len,
-            pad_token_id=config.pad_token_id
+            config=config
         )
         test_dataloader = DataLoader(
             test_dataset,
