@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 class SFTDataset(Dataset):
     """Dataset for supervised fine-tuning of NL2SQL model.
     Assumes data_file is a .txt file where each line contains space-separated
-    integer token IDs representing a full concatenated sequence (e.g., schema-NL-COT-SQL).
+    integer token IDs representing a full concatenated sequence:
+    <NL> ... </NL> <SCHEMA> ... </SCHEMA> <EXT> ... </EXT> <COT> ... </COT> <SQL> ... </SQL>
+    
+    Implements lazy loading: reads line offsets at initialization and processes lines on demand.
     """
     
     _source_truncation_warning_logged = False # Static class variable for one-time warning
@@ -29,6 +32,7 @@ class SFTDataset(Dataset):
             relation_builder: RelationMatrixBuilder instance
             config (NL2SQLConfig): Configuration object
         """
+        self.data_file_path = data_file # Store path for __getitem__
         self.tokenizer = tokenizer
         self.relation_builder = relation_builder
         self.config = config
@@ -49,47 +53,58 @@ class SFTDataset(Dataset):
 
         self.min_len = 4 # SFT rule: len < 4 is too short
         
+        # Get special token IDs for sequence splitting and truncation preservation
         self.cot_start_token_id = self.tokenizer.get_special_token_id('COT_START')
         self.sql_end_token_id = self.tokenizer.get_special_token_id('SQL_END')
         
-        # For SFT truncation, we want to preserve SQL_END if it's the last token.
-        # Based on user feedback, a generic 'EOS' token is not used to mark overall sequence end.
-        # The sequences are concatenations like schema-NL-COT-SQL, ending with SQL_END.
+        # For SFT truncation, we want to preserve SQL_END if it's the last token
         self.sft_end_special_tokens = {self.sql_end_token_id}
         logger.info(f"SFTDataset: Using {{ {self.sql_end_token_id}: '{self.tokenizer.special_tokens.get('SQL_END')}' }} as special end tokens for SFT truncation preservation.")
 
         self.dropped_count = 0
         self.truncated_count = 0
-        self._summary_logged_first_time = False # To log summary only once initially
+        self._summary_logged_first_time = False 
         self.last_logged_dropped_count = 0
         self.last_logged_truncated_count = 0
 
         logger.info(f"SFTDataset: Initializing with data_file='{data_file}', max_len={self.max_len}, min_len={self.min_len}, pad_id={self.pad_token_id}")
-        self.examples: List[List[int]] = []
-        raw_lines_count = 0
-        with open(data_file, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f):
-                raw_lines_count += 1
-                line = line.strip()
-                if not line:
-                    # This initial drop is for truly empty lines, not all-pad lines (handled in __getitem__)
-                    logger.debug(f"SFTDataset: Skipping empty line {line_num+1} in {data_file} at load time.")
-                    self.dropped_count += 1
-                    continue
-                try:
-                    token_ids = [int(token_id_str) for token_id_str in line.split()]
-                    if not token_ids: # Line had only whitespace, resulting in empty list
-                        logger.debug(f"SFTDataset: Skipping line {line_num+1} (whitespace only) in {data_file} at load time.")
-                        self.dropped_count += 1
-                        continue
-                    self.examples.append(token_ids)
-                except ValueError as e:
-                    logger.warning(f"SFTDataset: Error parsing token IDs (non-integer) on line {line_num+1} in {data_file}: {e}. Line: '{line[:100]}...' Skipping line at load time.")
-                    self.dropped_count += 1
-                    continue
         
-        logger.info(f"SFTDataset: Loaded {len(self.examples)} examples from {raw_lines_count} raw lines. Initial drops (empty/parse error): {self.dropped_count}")
-        self._log_counts_summary_if_needed(dataset_name="SFTDataset", force_log=True) # Log initial state
+        self.line_offsets: List[int] = []
+        self.num_lines = 0
+        initial_raw_lines = 0
+        initial_empty_or_whitespace_drops = 0
+
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(f"SFTDataset: Data file not found: {data_file}")
+
+        logger.info(f"SFTDataset: Scanning '{data_file}' to build line offsets...")
+        with open(data_file, 'rb') as f: # Open in binary mode to get byte offsets
+            while True:
+                offset = f.tell()
+                line_bytes = f.readline()
+                initial_raw_lines += 1
+                if not line_bytes:
+                    initial_raw_lines -=1 # Last readline is empty on EOF
+                    break
+                # Minimal check for truly empty or whitespace-only lines during offset scan
+                # More robust checks will happen in __getitem__
+                try:
+                    line_str = line_bytes.decode('utf-8').strip()
+                    if not line_str:
+                        initial_empty_or_whitespace_drops += 1
+                        # We don't add this line to offsets if it's completely empty/whitespace
+                        continue 
+                except UnicodeDecodeError:
+                    logger.warning(f"SFTDataset: UnicodeDecodeError on line {self.num_lines + 1} during initial scan. This line might be skipped or cause issues later.")
+                    # We'll still record its offset and let __getitem__ handle the error
+                    pass # Continue to add offset, let __getitem__ handle parsing error
+                
+                self.line_offsets.append(offset)
+                self.num_lines += 1
+        
+        self.dropped_count += initial_empty_or_whitespace_drops # Count lines dropped during initial scan
+        logger.info(f"SFTDataset: Scan complete. Found {self.num_lines} processable lines (offsets recorded). Total raw lines scanned: {initial_raw_lines}. Initial empty/whitespace drops from scan: {initial_empty_or_whitespace_drops}.")
+        self._log_counts_summary_if_needed(dataset_name="SFTDataset", force_log=True)
 
     def _log_counts_summary_if_needed(self, dataset_name: str, force_log: bool = False):
         current_dropped = self.dropped_count
@@ -100,20 +115,50 @@ class SFTDataset(Dataset):
                           current_truncated != self.last_logged_truncated_count)
 
         if has_significant_counts and (force_log or not self._summary_logged_first_time or counts_changed):
-            logger.info(f"{dataset_name} Counts: Dropped={current_dropped}, Truncated={current_truncated}. (Total loaded: {len(self.examples) + self.dropped_count})")
+            logger.info(f"{dataset_name} Counts: Dropped={current_dropped}, Truncated={current_truncated}. (Lines with offsets: {self.num_lines})")
             self.last_logged_dropped_count = current_dropped
             self.last_logged_truncated_count = current_truncated
             self._summary_logged_first_time = True
 
     def __len__(self):
-        # Log summary when __len__ is called, as it might be before full iteration.
-        self._log_counts_summary_if_needed(dataset_name="SFTDataset", force_log=True)
-        return len(self.examples) # Number of potentially processable examples
+        self._log_counts_summary_if_needed(dataset_name="SFTDataset", force_log=not self._summary_logged_first_time)
+        return self.num_lines # Number of lines with recorded offsets
 
     def __getitem__(self, idx):
-        if idx >= len(self.examples):
-             raise IndexError(f"Index {idx} out of range for SFTDataset with {len(self.examples)} examples.")
-        original_token_ids = self.examples[idx]
+        if not (0 <= idx < self.num_lines):
+             raise IndexError(f"Index {idx} out of range for SFTDataset with {self.num_lines} lines.")
+
+        try:
+            # Open file, seek, read line, then close. This is safer for multiprocessing.
+            with open(self.data_file_path, 'r', encoding='utf-8') as f:
+                f.seek(self.line_offsets[idx])
+                line_str = f.readline()
+        except Exception as e:
+            logger.error(f"SFTDataset [EX {idx}]: Error reading line from file at offset {self.line_offsets[idx]}: {e}")
+            self.dropped_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+            return None
+
+        line_str = line_str.strip()
+        if not line_str:
+            logger.debug(f"SFTDataset [EX {idx}]: Line is empty or whitespace after read. Dropping.")
+            self.dropped_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+            return None
+            
+        try:
+            original_token_ids = [int(token_id_str) for token_id_str in line_str.split()]
+            if not original_token_ids:
+                logger.debug(f"SFTDataset [EX {idx}]: Line resulted in empty token list after split. Dropping.")
+                self.dropped_count += 1
+                self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+                return None
+        except ValueError as e:
+            logger.warning(f"SFTDataset [EX {idx}]: Error parsing token IDs (non-integer): {e}. Line: '{line_str[:100]}...' Dropping.")
+            self.dropped_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+            return None
+        
         token_ids = list(original_token_ids) # Work with a copy
         
         # 1. Trim leading/trailing pad_ids
@@ -125,7 +170,7 @@ class SFTDataset(Dataset):
             end_idx -= 1
         token_ids = token_ids[start_idx:end_idx]
 
-        # 2. Rule: Empty / All tokens equal to pad_id (already handled by trim + empty check)
+        # 2. Rule: Empty / All tokens equal to pad_id
         if not token_ids:
             logger.debug(f"SFTDataset [EX {idx}]: Sequence empty after trimming pad_id ({self.pad_token_id}). Dropping.")
             self.dropped_count += 1
@@ -150,63 +195,85 @@ class SFTDataset(Dataset):
 
         # 5. Find COT_START and SQL_END tokens for splitting encoder input and decoder target
         try:
-            cot_start_index = token_ids.index(self.cot_start_token_id)
+            cot_start_idx = token_ids.index(self.cot_start_token_id)
         except ValueError:
             logger.warning(f"SFTDataset [EX {idx}]: COT_START token not found. Dropping sample.")
             self.dropped_count += 1
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
 
-        # Find the last SQL_END that appears after COT_START
-        sql_end_indices = [i for i, token in enumerate(token_ids) if token == self.sql_end_token_id and i > cot_start_index]
-        if not sql_end_indices:
-            logger.warning(f"SFTDataset [EX {idx}]: No SQL_END token found after COT_START. Dropping sample.")
+        try:
+            sql_end_idx = token_ids.index(self.sql_end_token_id)
+            if sql_end_idx <= cot_start_idx:
+                logger.warning(f"SFTDataset [EX {idx}]: SQL_END token appears before or at COT_START. Invalid sequence. Dropping sample.")
+                self.dropped_count += 1
+                self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+                return None
+        except ValueError:
+            logger.warning(f"SFTDataset [EX {idx}]: SQL_END token not found. Dropping sample.")
             self.dropped_count += 1
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
-        sql_end_index = sql_end_indices[-1]  # Take the last occurrence
 
         # Split into encoder input and decoder target
-        raw_encoder_input_tokens = token_ids[:cot_start_index]  # Up to but not including COT_START
-        raw_target_tokens = token_ids[cot_start_index:sql_end_index + 1]  # From COT_START through SQL_END
+        raw_encoder_input_tokens = token_ids[:cot_start_idx]  # Up to but not including COT_START
+        raw_target_tokens = token_ids[cot_start_idx:sql_end_idx + 1]  # From COT_START through SQL_END
 
-        # 6. Rule: Too long (SFT > max_len (2048))
+        # 6. Rule: Too long (SFT > max_len (e.g. 2048 for full sequence))
+        original_len_before_max_len_trunc = len(token_ids)
+        perform_max_len_truncation = False
         if len(token_ids) > self.max_len:
-            self.truncated_count += 1
-            # self._log_counts_summary_if_needed(dataset_name="SFTDataset") # Logged in __len__ or by interval
-            original_last_token = token_ids[-1]
+            perform_max_len_truncation = True
+            original_last_token_if_truncated = token_ids[-1] # Before truncating token_ids
             token_ids = token_ids[:self.max_len]
-            if self.max_len > 0 and original_last_token in self.sft_end_special_tokens and token_ids[-1] != original_last_token:
-                token_ids[-1] = original_last_token # Preserve special end token if possible
-            logger.debug(f"SFTDataset [EX {idx}]: Sequence truncated from {len(original_token_ids)} to {len(token_ids)} (max_len {self.max_len}).")
-        
-        full_token_ids_processed = token_ids # This is now the validated and possibly truncated list of ints
+            # Preserve special end token if it was the original last token and got cut off
+            if self.max_len > 0 and original_last_token_if_truncated in self.sft_end_special_tokens and \
+               token_ids[-1] != original_last_token_if_truncated:
+                token_ids[-1] = original_last_token_if_truncated 
+            logger.debug(f"SFTDataset [EX {idx}]: Full sequence truncated from {original_len_before_max_len_trunc} to {len(token_ids)} (max_len {self.max_len}).")
+            
+            # After truncation, check if we still have valid COT_START and SQL_END in sequence
+            try:
+                new_cot_start_idx = token_ids.index(self.cot_start_token_id)
+                new_sql_end_idx = token_ids.index(self.sql_end_token_id)
+                if new_sql_end_idx <= new_cot_start_idx:
+                    logger.warning(f"SFTDataset [EX {idx}]: After truncation, SQL_END appears before or at COT_START. Dropping sample.")
+                    self.dropped_count += 1
+                    self.truncated_count += 1
+                    self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+                    return None
+                # Update splits after truncation
+                raw_encoder_input_tokens = token_ids[:new_cot_start_idx]
+                raw_target_tokens = token_ids[new_cot_start_idx:new_sql_end_idx + 1]
+            except ValueError:
+                logger.warning(f"SFTDataset [EX {idx}]: After truncation, COT_START or SQL_END not found. Dropping sample.")
+                self.dropped_count += 1
+                self.truncated_count += 1
+                self._log_counts_summary_if_needed(dataset_name="SFTDataset")
+                return None
 
-        # --- Original SFTDataset logic starts, using full_token_ids_processed ---
-        try:
-            sql_start_index = full_token_ids_processed.index(self.sql_start_token_id)
-            raw_encoder_input_tokens = full_token_ids_processed[:sql_start_index]
-            raw_target_tokens = full_token_ids_processed[sql_start_index:]
-        except ValueError:
-            logger.warning(f"SFTDataset [EX {idx}]: SQL_START (ID {self.sql_start_token_id}) not found in validated sample. Len: {len(full_token_ids_processed)}. Sample: {full_token_ids_processed[:30]}... Using full as encoder input, empty target. May fail downstream.")
-            raw_encoder_input_tokens = full_token_ids_processed
-            raw_target_tokens = [] 
+        if perform_max_len_truncation:
+            self.truncated_count += 1
+            self._log_counts_summary_if_needed(dataset_name="SFTDataset")
 
-        sft_pg_source_max_len = self.config.phase_max_len_pg
+        # Pointer-Generator (PG) specific truncation for the source part (everything before COT)
         final_encoder_input_tokens = raw_encoder_input_tokens
+        sft_pg_source_max_len = self.config.phase_max_len_pg
         if self.config.use_pointer_generator and sft_pg_source_max_len is not None and \
            len(raw_encoder_input_tokens) > sft_pg_source_max_len:
-            if not SFTDataset._source_truncation_warning_logged: # Static class variable
+            if not SFTDataset._source_truncation_warning_logged:
                 logger.warning(
-                    f"SFTDataset: PG source (schema+NL+COT) length {len(raw_encoder_input_tokens)} exceeds phase_max_len_pg {sft_pg_source_max_len}. "
-                    f"Truncating from the beginning of source part. This warning is shown once per class instance."
+                    f"SFTDataset: PG source (pre-COT part) length {len(raw_encoder_input_tokens)} exceeds phase_max_len_pg {sft_pg_source_max_len}. "
+                    f"Truncating source part from the beginning. This warning is shown once per class instance."
                 )
-                SFTDataset._source_truncation_warning_logged = True # Mark per instance
+                SFTDataset._source_truncation_warning_logged = True
+            
             amount_to_cut = len(raw_encoder_input_tokens) - sft_pg_source_max_len
             final_encoder_input_tokens = raw_encoder_input_tokens[amount_to_cut:]
-        
+            logger.debug(f"SFTDataset [EX {idx}]: PG source part truncated from {len(raw_encoder_input_tokens)} to {len(final_encoder_input_tokens)} (PG source max: {sft_pg_source_max_len}).")
+
         if not final_encoder_input_tokens:
-             logger.debug(f"SFTDataset [EX {idx}]: final_encoder_input_tokens became empty after PG truncation or SQL_START split. Dropping. Original: {original_token_ids[:30]}")
+             logger.debug(f"SFTDataset [EX {idx}]: final_encoder_input_tokens became empty after PG truncation. Dropping. Original line: {original_token_ids[:30]}")
              self.dropped_count +=1
              self._log_counts_summary_if_needed(dataset_name="SFTDataset")
              return None
@@ -215,36 +282,44 @@ class SFTDataset(Dataset):
         input_ids = torch.tensor(final_encoder_input_tokens, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         labels = torch.tensor(raw_target_tokens, dtype=torch.long)
-        
-        # Labels should not exceed overall max_len. Already handled by initial truncation of full_token_ids_processed.
-        # If raw_target_tokens is empty (e.g. SQL_START was last or not found), labels tensor will be empty.
-        # This is typically handled by loss functions (ignore_index) or collator (skip if all labels empty).
 
         schema_meta: List = []
-        relation_matrix = torch.zeros((len(input_ids), len(input_ids)), dtype=torch.long)
+        relation_matrix_dim = len(final_encoder_input_tokens)
+        relation_matrix = torch.zeros((relation_matrix_dim, relation_matrix_dim), dtype=torch.long)
         schema_mask_for_pg = torch.zeros_like(input_ids, dtype=torch.bool)
 
-        if self.config.use_pointer_generator and len(input_ids) > 0:
+        if self.config.use_pointer_generator and relation_matrix_dim > 0:
             try:
                 schema_meta = self.relation_builder.parse_schema_tokens(final_encoder_input_tokens)
                 if not schema_meta:
                     logger.debug(f"SFTDataset [EX {idx}]: No schema tokens parsed for PG from encoder input. PG copy may be ineffective. Input: {final_encoder_input_tokens[:50]}")
-                relation_matrix = self.relation_builder.build_relation_matrix(final_encoder_input_tokens, schema_meta)
+                
+                relation_matrix = self.relation_builder.build_relation_matrix(
+                    final_encoder_input_tokens,
+                    schema_meta,
+                    max_seq_len_for_matrix=relation_matrix_dim
+                )
+                
                 for token_s in schema_meta:
                     start_idx_s, end_idx_s = token_s.span_start, token_s.span_end
-                    if start_idx_s < len(input_ids) and end_idx_s < len(input_ids):
+                    if start_idx_s < relation_matrix_dim and end_idx_s < relation_matrix_dim:
                         schema_mask_for_pg[start_idx_s : end_idx_s + 1] = True
-                    elif start_idx_s < len(input_ids):
-                        schema_mask_for_pg[start_idx_s : len(input_ids)] = True
+                    elif start_idx_s < relation_matrix_dim:
+                        schema_mask_for_pg[start_idx_s : relation_matrix_dim] = True
             except Exception as e:
                 logger.error(f"SFTDataset [EX {idx}]: Error building relation matrix/schema mask: {e}", exc_info=True)
+                relation_matrix = torch.zeros((relation_matrix_dim, relation_matrix_dim), dtype=torch.long)
+                schema_mask_for_pg = torch.zeros_like(input_ids, dtype=torch.bool)
         
         # Verify first sample globally (for debugging)
         if not SFTDataset._first_sample_globally_logged:
             try:
-                logger.info("\nFirst sample verification:")
-                logger.info(f"Encoder input (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
-                logger.info(f"Decoder target (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
+                logger.info("\nFirst sample verification (SFTDataset - lazy loaded):")
+                logger.info(f"Original line (idx {idx}): '{line_str[:100]}...'")
+                logger.info(f"Encoder input tokens (before COT) (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
+                logger.info(f"Decoder target tokens (COT through SQL_END) (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
+                if self.config.use_pointer_generator:
+                    logger.info(f"Schema mask for PG (sum of True): {schema_mask_for_pg.sum().item()}")
                 SFTDataset._first_sample_globally_logged = True
             except Exception as e:
                 logger.error(f"Error logging first sample: {e}")
@@ -252,9 +327,9 @@ class SFTDataset(Dataset):
         return {
             'encoder_input': input_ids,
             'decoder_target': labels,
-            'encoder_attention_mask': attention_mask, 
-            'relation_matrix': relation_matrix,  
-            'schema_mask': schema_mask_for_pg    
+            'encoder_attention_mask': attention_mask,
+            'relation_matrix': relation_matrix,
+            'schema_mask': schema_mask_for_pg
         }
 
     @staticmethod
@@ -270,59 +345,68 @@ class SFTDataset(Dataset):
 
         # 2. Lightweight guard: Filter items if encoder_input is empty (should be rare due to __getitem__ checks)
         #    Also check for empty decoder_target if it implies an invalid sample for the model.
-        #    For now, models are often robust to empty targets if the loss function handles it (e.g. ignore_index for padding)
-        #    or if it means "predict EOS immediately". Let's primarily ensure encoder_input is valid.
         
         processed_batch = []
         for i, item in enumerate(batch):
             if not isinstance(item, dict) or 'encoder_input' not in item or 'decoder_target' not in item:
                 logger.warning(f"SFTDataset.collate_fn: Item {i} is not a valid dict or missing keys. Skipping. Item: {str(item)[:100]}")
                 continue
-            if item['encoder_input'].numel() == 0:
+            if item['encoder_input'].numel() == 0: # Checks if tensor has zero elements
                 logger.debug(f"SFTDataset.collate_fn: Item {i} has empty 'encoder_input' tensor. Skipping item.")
                 continue
-            # Optionally, add a check for empty decoder_target if it's strictly invalid for the model
-            # e.g. if item['decoder_target'].numel() == 0 and not model_can_handle_empty_target:
+            # Optional: Check for empty decoder_target if it's strictly invalid for the model
+            # For SFT, an empty decoder_target (e.g., if only <SQL> was present) might be valid if the model predicts EOS.
+            # If item['decoder_target'].numel() == 0 and not model_can_handle_empty_target:
             #    logger.debug(f"SFTDataset.collate_fn: Item {i} has empty 'decoder_target'. Skipping.")
             #    continue
             processed_batch.append(item)
         
         batch = processed_batch
         if not batch:
-            if original_batch_len > 0: # if some items existed before this collator-specific filtering
+            if original_batch_len > 0: 
                  logger.warning("SFTDataset.collate_fn: Batch is empty after collator's internal filtering (e.g. empty tensors). Skipping batch.")
             return None
 
         # Proceed with padding and batching valid items
+        # Max length for encoder_input parts
         max_enc_len = max(item['encoder_input'].size(0) for item in batch)
-        max_dec_len = max(item['decoder_target'].size(0) for item in batch if item['decoder_target'].numel() > 0) if any(item['decoder_target'].numel() > 0 for item in batch) else 0
+        # Max length for decoder_target parts. Handle case where all decoder_targets might be empty.
+        max_dec_len = 0
+        if any(item['decoder_target'].numel() > 0 for item in batch):
+            max_dec_len = max(item['decoder_target'].size(0) for item in batch if item['decoder_target'].numel() > 0)
+
 
         current_batch_size = len(batch)
         
         # Initialize tensors with the provided pad_id
         encoder_input_batch = torch.full((current_batch_size, max_enc_len), pad_id, dtype=torch.long)
-        encoder_attention_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool)
+        # Attention mask should be boolean, False for padded tokens.
+        encoder_attention_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool) 
         decoder_target_batch = torch.full((current_batch_size, max_dec_len), pad_id, dtype=torch.long)
+        
+        # Relation matrix is (B, max_enc_len, max_enc_len)
         relation_matrix_batch = torch.zeros(current_batch_size, max_enc_len, max_enc_len, dtype=torch.long)
+        # Schema mask is (B, max_enc_len)
         schema_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool)
         
         for i, item in enumerate(batch):
             enc_len = item['encoder_input'].size(0)
             encoder_input_batch[i, :enc_len] = item['encoder_input']
-            encoder_attention_mask_batch[i, :enc_len] = item['encoder_attention_mask']
+            # item['encoder_attention_mask'] is already True for non-padded, so directly assign.
+            encoder_attention_mask_batch[i, :enc_len] = item['encoder_attention_mask'] 
             
             # Relation matrix and schema mask checks (shape based on enc_len)
-            if 'relation_matrix' in item and item['relation_matrix'].ndim == 2 and\
+            if 'relation_matrix' in item and item['relation_matrix'].ndim == 2 and \
                item['relation_matrix'].shape[0] == enc_len and item['relation_matrix'].shape[1] == enc_len:
                 relation_matrix_batch[i, :enc_len, :enc_len] = item['relation_matrix']
-            # else: (Optional: log if shape mismatch and non-default tensor was provided)
+            # else: (Optional: log if shape mismatch and non-default tensor was provided, or if key missing)
 
             if 'schema_mask' in item and item['schema_mask'].ndim == 1 and item['schema_mask'].shape[0] == enc_len:
                  schema_mask_batch[i, :enc_len] = item['schema_mask']
-            # else: (Optional: log if shape mismatch and non-default tensor was provided)
+            # else: (Optional: log if shape mismatch or key missing)
 
             dec_len = item['decoder_target'].size(0)
-            if dec_len > 0:
+            if dec_len > 0: # Only copy if decoder_target is not empty
                 decoder_target_batch[i, :dec_len] = item['decoder_target']
         
         return {
