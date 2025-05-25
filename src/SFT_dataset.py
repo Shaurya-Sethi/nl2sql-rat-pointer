@@ -297,6 +297,19 @@ class SFTDataset(Dataset):
                 schema_end = final_encoder_input_tokens.index(schema_end_id)
                 # Extract schema tokens (including <SCHEMA> and </SCHEMA> tokens; adjust as needed for your parser)
                 schema_tokens = final_encoder_input_tokens[schema_start:schema_end + 1]
+                # --- DEBUG LOGGING ---
+                logger.warning(f"[PG DEBUG][idx={idx}] Extracted schema_tokens (IDs): {schema_tokens}")
+                try:
+                    detok_schema = self.tokenizer.decode(schema_tokens, skip_special_tokens=False)
+                except Exception as e:
+                    detok_schema = f"<decode error: {e}>"
+                logger.warning(f"[PG DEBUG][idx={idx}] Detokenized schema segment: '{detok_schema}'")
+                logger.warning(f"[PG DEBUG][idx={idx}] Full encoder input tokens: {final_encoder_input_tokens}")
+                try:
+                    detok_full = self.tokenizer.decode(final_encoder_input_tokens, skip_special_tokens=False)
+                except Exception as e:
+                    detok_full = f"<decode error: {e}>"
+                logger.warning(f"[PG DEBUG][idx={idx}] Detokenized full encoder input: '{detok_full}'")
             except ValueError:
                 logger.warning(f"SFTDataset [EX {idx}]: SCHEMA_START or SCHEMA_END not found in encoder input. Skipping PG schema parse.")
                 schema_tokens = []
