@@ -289,13 +289,25 @@ class SFTDataset(Dataset):
         schema_mask_for_pg = torch.zeros_like(input_ids, dtype=torch.bool)
 
         if self.config.use_pointer_generator and relation_matrix_dim > 0:
+            # --- NEW: Extract just the schema segment from encoder input ---
+            schema_start_id = self.tokenizer.get_special_token_id("SCHEMA_START")
+            schema_end_id = self.tokenizer.get_special_token_id("SCHEMA_END")
             try:
-                schema_meta = self.relation_builder.parse_schema_tokens(final_encoder_input_tokens)
+                schema_start = final_encoder_input_tokens.index(schema_start_id)
+                schema_end = final_encoder_input_tokens.index(schema_end_id)
+                # Extract schema tokens (including <SCHEMA> and </SCHEMA> tokens; adjust as needed for your parser)
+                schema_tokens = final_encoder_input_tokens[schema_start:schema_end + 1]
+            except ValueError:
+                logger.warning(f"SFTDataset [EX {idx}]: SCHEMA_START or SCHEMA_END not found in encoder input. Skipping PG schema parse.")
+                schema_tokens = []
+
+            try:
+                schema_meta = self.relation_builder.parse_schema_tokens(schema_tokens)
                 if not schema_meta:
-                    logger.debug(f"SFTDataset [EX {idx}]: No schema tokens parsed for PG from encoder input. PG copy may be ineffective. Input: {final_encoder_input_tokens[:50]}")
+                    logger.debug(f"SFTDataset [EX {idx}]: No schema tokens parsed for PG from encoder input. PG copy may be ineffective. Input: {schema_tokens[:50]}")
                 
                 relation_matrix = self.relation_builder.build_relation_matrix(
-                    final_encoder_input_tokens,
+                    final_encoder_input_tokens,  # Still size of encoder input!
                     schema_meta,
                     max_seq_len_for_matrix=relation_matrix_dim
                 )
