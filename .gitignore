@@ -86,3 +86,8 @@ dmypy.json
 .pyre/
 .pytype/
 cython_debug/
+
+# Others
+project_context.md 
+inspect_tokenized_sft_data.py
+
