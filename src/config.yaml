@@ -45,7 +45,7 @@ pretrain:
   max_batch_size:        16      # validation
 
   # ---------- optimisation --------------------------- #
-  learning_rate:   1.0e-6        # reduced from 1.0e-4 -> then from 3e-5
+  learning_rate:   1.0e-4
   scheduler:       cosine
   warmup_steps:    2500
   max_steps:       46875
