@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Project context or local docs
+project_context.md
+
 # Virtual environments
 venv/
 env/
