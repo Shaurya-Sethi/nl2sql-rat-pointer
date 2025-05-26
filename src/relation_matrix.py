@@ -49,6 +49,11 @@ class RelationMatrixBuilder:
         try:
             self.sp = tokenizer.sp
             self.tok_id = tokenizer.special_token_ids
+            
+            # Cache for decoded tokens to improve performance
+            self._decode_cache = {}
+            self._cache_hits = 0
+            self._cache_misses = 0
 
             # Validate special tokens are present in the provided tokenizer's mapping
             required_token_names = {
@@ -59,19 +64,18 @@ class RelationMatrixBuilder:
             missing_tokens = required_token_names - set(self.tok_id.keys())
             if missing_tokens:
                 raise ValueError(f"Missing required special token names in tokenizer's special_token_ids: {missing_tokens}")
-
             self.num_relations = num_relations
             
             if num_relations < len(self._REL_MAP):
                 raise ValueError(f"num_relations={num_relations} must be at least {len(self._REL_MAP)}")
-            
+                
         except Exception as e:
             logger.error(f"Error initializing RelationMatrixBuilder: {e}")
             raise
 
     def _decode(self, ids: List[int]) -> str:
         """
-        Decode token IDs to string.
+        Decode token IDs to string with caching for performance.
         
         Args:
             ids: List of token IDs
@@ -79,11 +83,169 @@ class RelationMatrixBuilder:
         Returns:
             Decoded string
         """
+        if not ids:
+            return ""
+            
+        # Use tuple as cache key since lists are not hashable
+        cache_key = tuple(ids)
+        
+        if cache_key in self._decode_cache:
+            self._cache_hits += 1
+            return self._decode_cache[cache_key]
+        
         try:
-            return self.sp.decode(ids) if ids else ""
+            result = self.sp.decode(ids)
+            self._decode_cache[cache_key] = result
+            self._cache_misses += 1
+            
+            # Prevent cache from growing too large
+            if len(self._decode_cache) > 1000:
+                # Remove oldest entries (simple FIFO)
+                oldest_keys = list(self._decode_cache.keys())[:100]
+                for key in oldest_keys:
+                    del self._decode_cache[key]
+                    
+            return result
         except Exception as e:
             logger.error(f"Error decoding tokens {ids}: {e}")
             return ""
+
+    def _extract_name_before_delimiter(self, tokens: List[str], delimiter: str) -> Tuple[str, bool]:
+        """
+        Extract name from token sequence, handling delimiter placement edge cases.
+        
+        Args:
+            tokens: List of token strings
+            delimiter: Delimiter to look for
+            
+        Returns:
+            Tuple of (extracted_name, found_delimiter)
+        """
+        if not tokens:
+            return "", False
+        full_string = "".join(tokens)
+        if delimiter not in full_string:
+            return "", False
+        name = full_string.split(delimiter, 1)[0].strip()
+        if not name:
+            logger.warning(f"Delimiter '{delimiter}' found at start of token sequence: {tokens}")
+            return "", False
+        return name, True
+
+    def _normalize_name(self, name: str) -> str:
+        """
+        Enhanced normalization handling more edge cases.
+        
+        Args:
+            name: Raw name string
+            
+        Returns:
+            Normalized name
+        """
+        if not name:
+            return ""
+        normalized = re.sub(r'\s+', ' ', name.strip()).lower()
+        # Remove various quote types and brackets
+        normalized = re.sub(r'^["`\'\[\]]+|["`\'\[\]]+$', '', normalized)
+        # Handle escaped quotes
+        normalized = normalized.replace('""', '"').replace("''", "'")
+        return normalized
+
+    def _is_valid_identifier(self, name: str) -> bool:
+        """
+        Enhanced identifier validation supporting more database naming conventions.
+        
+        Args:
+            name: Name to validate
+            
+        Returns:
+            True if valid identifier
+        """
+        if not name or not name.strip():
+            return False
+        normalized = self._normalize_name(name)
+        patterns = [
+            r'^[a-z_][a-z0-9_]*$',           # Standard: table_name
+            r'^[a-z][a-z0-9]*$',             # Simple: tablename
+            r'^[a-z][a-z0-9_-]*[a-z0-9]$',  # With hyphens: table-name
+            r'^[a-z0-9\u0080-\uFFFF _\-\[\]`"\']+$', # Unicode, quoted, etc.
+        ]
+        return any(re.match(pattern, normalized) for pattern in patterns)
+
+    def _find_balanced_delimiter(self, full_ids: List[int], start_pos: int, end_pos: int, 
+                                delimiter: str, max_lookahead: int = 15) -> Tuple[int, bool]:
+        """
+        Find the next occurrence of a delimiter, handling edge cases.
+        
+        Args:
+            full_ids: Token ID list
+            start_pos: Starting position
+            end_pos: Ending position  
+            delimiter: Delimiter to find
+            max_lookahead: Maximum tokens to look ahead
+            
+        Returns:
+            Tuple of (position, found)
+        """
+        j = start_pos
+        tokens_examined = 0
+        
+        while j < end_pos and tokens_examined < max_lookahead:
+            try:
+                part = self._decode([full_ids[j]])
+                if delimiter in part:
+                    return j, True
+                j += 1
+                tokens_examined += 1
+            except Exception as e:
+                logger.warning(f"Error decoding token at position {j}: {e}")
+                j += 1
+                tokens_examined += 1
+                
+        return j, False
+
+    def _extract_fk_references(self, payload: str) -> Tuple[Optional[str], Optional[str], str]:
+        """
+        Extract FK reference information from payload with improved parsing.
+        
+        Args:
+            payload: FK payload string
+            
+        Returns:
+            Tuple of (ref_table, ref_column, column_name)
+        """
+        ref_tbl, ref_col = None, None
+        col_part = payload.strip()
+        
+        # Handle various FK formats:
+        # "col_name -> ref_table.ref_col"
+        # "col_name->ref_table.ref_col" 
+        # "col_name -> ref_table . ref_col"
+        if "->" in payload:
+            parts = payload.split("->", 1)
+            if len(parts) == 2:
+                col_part = parts[0].strip()
+                ref_part = parts[1].strip()
+                
+                # Handle space around dot: "table . column"
+                ref_part = re.sub(r'\s*\.\s*', '.', ref_part)
+                
+                if "." in ref_part:
+                    ref_parts = ref_part.split(".", 1)
+                    if len(ref_parts) == 2:
+                        ref_tbl = self._normalize_name(ref_parts[0])
+                        ref_col = self._normalize_name(ref_parts[1])
+                        
+                        # Validate reference names
+                        if not self._is_valid_identifier(ref_tbl):
+                            logger.warning(f"Invalid FK reference table name: '{ref_parts[0]}'")
+                            ref_tbl = None
+                        if not self._is_valid_identifier(ref_col):
+                            logger.warning(f"Invalid FK reference column name: '{ref_parts[1]}'")
+                            ref_col = None
+        
+        col_part = self._normalize_name(col_part)
+        return ref_tbl, ref_col, col_part
 
     def validate_schema_format(self, full_ids: List[int]) -> bool:
         """
@@ -139,7 +301,7 @@ class RelationMatrixBuilder:
 
     def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
         """
-        Parse schema tokens from input sequence.
+        Parse schema tokens from input sequence with robust multi-token handling.
 
         Args:
             full_ids: List of token IDs
@@ -149,34 +311,26 @@ class RelationMatrixBuilder:
         """
         try:
             schema_tokens: List[SchemaToken] = []
-
-            # Validate schema format before parsing
             if not self.validate_schema_format(full_ids):
                 logger.warning("Invalid schema format, returning empty schema tokens list")
                 return schema_tokens
-
-            # Find schema region
             try:
                 s_start = full_ids.index(self.tok_id['SCHEMA_START']) + 1
                 s_end = full_ids.index(self.tok_id['SCHEMA_END'])
             except ValueError:
                 logger.warning("No schema region found")
                 return schema_tokens
-
             schema_region_ids = full_ids[s_start:s_end]
             try:
                 detok_schema_region = self._decode(schema_region_ids)
             except Exception as e:
                 detok_schema_region = f"<decode error: {e}>"
-            logger.warning(f"[SCHEMA_PARSE_DEBUG] Schema region token IDs: {schema_region_ids}")
-            logger.warning(f"[SCHEMA_PARSE_DEBUG] Detokenized schema region: '{detok_schema_region}'")
-
+            logger.debug(f"[SCHEMA_PARSE_DEBUG] Schema region token IDs: {schema_region_ids}")
+            logger.debug(f"[SCHEMA_PARSE_DEBUG] Detokenized schema region: '{detok_schema_region}'")
             i = s_start
             current_table: Optional[str] = None
-
             while i < s_end:
                 tok = full_ids[i]
-
                 # Parse PK
                 if tok == self.tok_id['PK_START']:
                     try:
@@ -184,12 +338,14 @@ class RelationMatrixBuilder:
                         while j < s_end and full_ids[j] != self.tok_id['PK_END']:
                             j += 1
                         if j >= s_end:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed PK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed PK tag at position {i}, skipping. Schema segment: {full_ids[i:min(j+3, s_end)]} | Detok: '{self._decode(full_ids[i:min(j+3, s_end)])}'")
                             i += 1
                             continue
-                        col_name = self._decode(full_ids[i+1:j])
+                        pk_tokens = full_ids[i+1:j]
+                        col_name = self._decode(pk_tokens).strip()
+                        col_name = self._normalize_name(col_name)
                         if not col_name:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty PK column name at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty PK column name at position {i}, skipping. Token IDs: {pk_tokens} | Detok: '{self._decode(pk_tokens)}'")
                             i = j + 1
                             continue
                         schema_tokens.append(SchemaToken(
@@ -204,7 +360,6 @@ class RelationMatrixBuilder:
                         logger.error(f"Error parsing PK at position {i}: {e}")
                         i += 1
                         continue
-
                 # Parse FK
                 if tok == self.tok_id['FK_START']:
                     try:
@@ -212,21 +367,16 @@ class RelationMatrixBuilder:
                         while j < s_end and full_ids[j] != self.tok_id['FK_END']:
                             j += 1
                         if j >= s_end:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed FK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed FK tag at position {i}, skipping. Schema segment: {full_ids[i:min(j+3, s_end)]} | Detok: '{self._decode(full_ids[i:min(j+3, s_end)])}'")
                             i += 1
                             continue
-                        payload = self._decode(full_ids[i+1:j])
+                        fk_tokens = full_ids[i+1:j]
+                        payload = self._decode(fk_tokens).strip()
                         if not payload:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty FK payload at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty FK payload at position {i}, skipping. Token IDs: {fk_tokens} | Detok: '{self._decode(fk_tokens)}'")
                             i = j + 1
                             continue
-                        ref_tbl, ref_col = None, None
-                        if "->" in payload:
-                            col_part, ref_part = [p.strip() for p in payload.split("->", 1)]
-                            if "." in ref_part:
-                                ref_tbl, ref_col = [p.strip() for p in ref_part.split(".", 1)]
-                        else:
-                            col_part = payload
+                        ref_tbl, ref_col, col_part = self._extract_fk_references(payload)
                         schema_tokens.append(SchemaToken(
                             span_start=i, span_end=j,
                             token_type='fk',
@@ -240,67 +390,93 @@ class RelationMatrixBuilder:
                         logger.error(f"Error parsing FK at position {i}: {e}")
                         i += 1
                         continue
-
-                # PATCH: Robust multi-token table name extraction
+                # Robust multi-token table name extraction
                 try:
                     piece = self._decode([tok])
-                    # NEW TABLE LOGIC: gather tokens until one contains '('
                     if "(" in piece or piece == "(":
                         t_start = i
                         table_tokens = []
                         j = i
-                        while j < s_end:
+                        skip_pos, has_consecutive = self._handle_consecutive_delimiters(full_ids, i, s_end, "(")
+                        if has_consecutive and skip_pos - i > 1:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Skipping consecutive '(' tokens at position {i}-{skip_pos}")
+                            i = skip_pos
+                            continue
+                        max_table_tokens = 5
+                        while j < s_end and len(table_tokens) < max_table_tokens:
                             part = self._decode([full_ids[j]])
                             table_tokens.append(part)
                             if "(" in part:
                                 break
                             j += 1
-                        table_name = "".join(table_tokens).split("(", 1)[0].strip()
-                        if table_name:
+                        table_name, found_delim = self._extract_name_before_delimiter(table_tokens, "(")
+                        if found_delim and table_name and self._is_valid_identifier(table_name):
                             current_table = table_name
-                            schema_tokens.append(SchemaToken(
+                            token = SchemaToken(
                                 span_start=t_start, span_end=j,
                                 token_type='table',
                                 table_name=current_table
-                            ))
+                            )
+                            if self._validate_parsed_token(token):
+                                schema_tokens.append(token)
+                                logger.debug(f"[SCHEMA_PARSE_DEBUG] Parsed table: '{current_table}' at position {t_start}-{j}")
+                            else:
+                                logger.warning(f"[SCHEMA_PARSE_DEBUG] Invalid table token: {token}")
                         else:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty table name at position {t_start}-{j}, skipping. Token IDs: {full_ids[t_start:j+1]} | Detok: '{''.join(table_tokens)}'")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Invalid table name: '{table_name}' at position {t_start}-{j}, clearing current_table")
+                            current_table = None
                         i = j + 1
                         continue
-                    # Column pattern: name followed by colon
-                    if ":" in piece:
-                        col_name = piece.split(":", 1)[0].strip()
-                        if not col_name:
-                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty column name at position {i}, skipping. Token ID: {tok} | Detok: '{piece}' | Schema region: {schema_region_ids}")
-                            i += 1
-                            continue
-                        schema_tokens.append(SchemaToken(
-                            span_start=i, span_end=i,
-                            token_type='column',
-                            table_name=current_table,
-                            column_name=col_name
-                        ))
+                    # Robust multi-token column name extraction
+                    col_tokens = []
+                    j = i
+                    found_colon = False
+                    max_lookahead = min(10, s_end - i)
+                    skip_pos, has_consecutive = self._handle_consecutive_delimiters(full_ids, i, s_end, ":")
+                    if has_consecutive and skip_pos - i > 1:
+                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Skipping consecutive ':' tokens at position {i}-{skip_pos}")
+                        i = skip_pos
+                        continue
+                    while j < s_end and len(col_tokens) < max_lookahead:
+                        part = self._decode([full_ids[j]])
+                        col_tokens.append(part)
+                        if ":" in part:
+                            found_colon = True
+                            break
+                        j += 1
+                    if found_colon:
+                        col_name, found_delim = self._extract_name_before_delimiter(col_tokens, ":")
+                        col_name = self._normalize_name(col_name)
+                        if found_delim and col_name and self._is_valid_identifier(col_name):
+                            token = SchemaToken(
+                                span_start=i, span_end=j,
+                                token_type='column',
+                                table_name=current_table,
+                                column_name=col_name
+                            )
+                            if self._validate_parsed_token(token):
+                                schema_tokens.append(token)
+                                logger.debug(f"[SCHEMA_PARSE_DEBUG] Parsed column: '{col_name}' in table '{current_table}' at position {i}-{j}")
+                            else:
+                                logger.warning(f"[SCHEMA_PARSE_DEBUG] Invalid column token: {token}")
+                        else:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Invalid column name: '{col_name}' at position {i}-{j}, skipping. Token IDs: {full_ids[i:j+1]} | Detok: '{''.join(col_tokens)}'")
+                        i = j + 1
+                        continue
+                    else:
                         i += 1
                         continue
                 except Exception as e:
                     logger.error(f"Error parsing token at position {i}: {e}")
                     i += 1
                     continue
-
-                i += 1
-
-            # Validate parsed schema tokens
             if not schema_tokens:
                 logger.warning("No schema tokens parsed from valid schema region")
-
-            # Log schema parsing summary
             token_types = {}
             for token in schema_tokens:
                 token_types[token.token_type] = token_types.get(token.token_type, 0) + 1
             logger.info(f"Schema parsing summary: {token_types}")
-
             return schema_tokens
-
         except Exception as e:
             logger.error(f"Error parsing schema tokens: {e}")
             return []
@@ -455,3 +631,67 @@ class RelationMatrixBuilder:
             # Fallback based on original schema string length if schema_ids failed or max_seq_len is complex
             fallback_len = max_seq_len_for_matrix if max_seq_len_for_matrix is not None else (len(schema) if schema else 1)
             return torch.zeros((fallback_len, fallback_len), dtype=torch.long)
+        
+    def _handle_consecutive_delimiters(self, full_ids: List[int], pos: int, s_end: int, delimiter: str) -> Tuple[int, bool]:
+        """
+        Handle cases where delimiters appear multiple times consecutively.
+        
+        Args:
+            full_ids: Token ID list
+            pos: Current position
+            s_end: Schema end position
+            delimiter: Delimiter to check for
+            
+        Returns:
+            Tuple of (next_valid_position, found_valid_content)
+        """
+        consecutive_delims = 0
+        j = pos
+        
+        while j < s_end:
+            part = self._decode([full_ids[j]])
+            if part.strip() == delimiter:
+                consecutive_delims += 1
+                j += 1
+                if consecutive_delims > 3:  # Prevent infinite loops
+                    logger.warning(f"Too many consecutive '{delimiter}' delimiters at position {pos}")
+                    return j, False
+            else:
+                break
+                
+        return j, consecutive_delims > 0
+
+    def _validate_parsed_token(self, token: SchemaToken) -> bool:
+        """
+        Validate a parsed schema token for consistency.
+        
+        Args:
+            token: SchemaToken to validate
+            
+        Returns:
+            True if valid
+        """
+        try:
+            # Basic validation
+            if token.span_start < 0 or token.span_end < token.span_start:
+                return False
+                
+            # Type-specific validation
+            if token.token_type == 'table':
+                return bool(token.table_name and self._is_valid_identifier(token.table_name))
+            elif token.token_type in ['column', 'pk']:
+                return bool(token.column_name and self._is_valid_identifier(token.column_name))
+            elif token.token_type == 'fk':
+                valid_col = bool(token.column_name and self._is_valid_identifier(token.column_name))
+                if token.references:
+                    ref_tbl, ref_col = token.references
+                    valid_ref = bool(ref_tbl and ref_col and 
+                                   self._is_valid_identifier(ref_tbl) and 
+                                   self._is_valid_identifier(ref_col))
+                    return valid_col and valid_ref
+                return valid_col
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error validating token: {e}")
+            return False
