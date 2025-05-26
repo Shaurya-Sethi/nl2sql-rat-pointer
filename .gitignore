@@ -88,6 +88,5 @@ dmypy.json
 cython_debug/
 
 # Others
-.clinerules\workflows\project-Transqlate-context.md
+project-Transqlate-context.md
 inspect_tokenized_sft_data.py
-
