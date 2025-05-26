@@ -1,3 +1,4 @@
+DEBUG_VERBOSE = False  # Set True to enable deep per-sample debug logging
 import os
 import logging
 import torch
@@ -298,18 +299,19 @@ class SFTDataset(Dataset):
                 # Extract schema tokens (including <SCHEMA> and </SCHEMA> tokens; adjust as needed for your parser)
                 schema_tokens = final_encoder_input_tokens[schema_start:schema_end + 1]
                 # --- DEBUG LOGGING ---
-                logger.warning(f"[PG DEBUG][idx={idx}] Extracted schema_tokens (IDs): {schema_tokens}")
-                try:
-                    detok_schema = self.tokenizer.decode(schema_tokens, skip_special_tokens=False)
-                except Exception as e:
-                    detok_schema = f"<decode error: {e}>"
-                logger.warning(f"[PG DEBUG][idx={idx}] Detokenized schema segment: '{detok_schema}'")
-                logger.warning(f"[PG DEBUG][idx={idx}] Full encoder input tokens: {final_encoder_input_tokens}")
-                try:
-                    detok_full = self.tokenizer.decode(final_encoder_input_tokens, skip_special_tokens=False)
-                except Exception as e:
-                    detok_full = f"<decode error: {e}>"
-                logger.warning(f"[PG DEBUG][idx={idx}] Detokenized full encoder input: '{detok_full}'")
+                if DEBUG_VERBOSE:
+                    logger.debug(f"[PG DEBUG][idx={idx}] Extracted schema_tokens (IDs): {schema_tokens}")
+                    try:
+                        detok_schema = self.tokenizer.decode(schema_tokens, skip_special_tokens=False)
+                    except Exception as e:
+                        detok_schema = f"<decode error: {e}>"
+                    logger.debug(f"[PG DEBUG][idx={idx}] Detokenized schema segment: '{detok_schema}'")
+                    logger.debug(f"[PG DEBUG][idx={idx}] Full encoder input tokens: {final_encoder_input_tokens}")
+                    try:
+                        detok_full = self.tokenizer.decode(final_encoder_input_tokens, skip_special_tokens=False)
+                    except Exception as e:
+                        detok_full = f"<decode error: {e}>"
+                    logger.debug(f"[PG DEBUG][idx={idx}] Detokenized full encoder input: '{detok_full}'")
             except ValueError:
                 logger.warning(f"SFTDataset [EX {idx}]: SCHEMA_START or SCHEMA_END not found in encoder input. Skipping PG schema parse.")
                 schema_tokens = []
@@ -338,14 +340,14 @@ class SFTDataset(Dataset):
                 schema_mask_for_pg = torch.zeros_like(input_ids, dtype=torch.bool)
         
         # Verify first sample globally (for debugging)
-        if not SFTDataset._first_sample_globally_logged:
+        if DEBUG_VERBOSE and not SFTDataset._first_sample_globally_logged:
             try:
-                logger.info("\nFirst sample verification (SFTDataset - lazy loaded):")
-                logger.info(f"Original line (idx {idx}): '{line_str[:100]}...'")
-                logger.info(f"Encoder input tokens (before COT) (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
-                logger.info(f"Decoder target tokens (COT through SQL_END) (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
+                logger.debug("\nFirst sample verification (SFTDataset - lazy loaded):")
+                logger.debug(f"Original line (idx {idx}): '{line_str[:100]}...'")
+                logger.debug(f"Encoder input tokens (before COT) (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
+                logger.debug(f"Decoder target tokens (COT through SQL_END) (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
                 if self.config.use_pointer_generator:
-                    logger.info(f"Schema mask for PG (sum of True): {schema_mask_for_pg.sum().item()}")
+                    logger.debug(f"Schema mask for PG (sum of True): {schema_mask_for_pg.sum().item()}")
                 SFTDataset._first_sample_globally_logged = True
             except Exception as e:
                 logger.error(f"Error logging first sample: {e}")
