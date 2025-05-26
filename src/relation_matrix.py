@@ -163,6 +163,14 @@ class RelationMatrixBuilder:
                 logger.warning("No schema region found")
                 return schema_tokens
 
+            schema_region_ids = full_ids[s_start:s_end]
+            try:
+                detok_schema_region = self._decode(schema_region_ids)
+            except Exception as e:
+                detok_schema_region = f"<decode error: {e}>"
+            logger.warning(f"[SCHEMA_PARSE_DEBUG] Schema region token IDs: {schema_region_ids}")
+            logger.warning(f"[SCHEMA_PARSE_DEBUG] Detokenized schema region: '{detok_schema_region}'")
+
             i = s_start
             current_table: Optional[str] = None
 
@@ -176,12 +184,12 @@ class RelationMatrixBuilder:
                         while j < s_end and full_ids[j] != self.tok_id['PK_END']:
                             j += 1
                         if j >= s_end:
-                            logger.warning(f"Unclosed PK tag at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed PK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
                             i += 1
                             continue
                         col_name = self._decode(full_ids[i+1:j])
                         if not col_name:
-                            logger.warning(f"Empty PK column name at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty PK column name at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
                             i = j + 1
                             continue
                         schema_tokens.append(SchemaToken(
@@ -204,15 +212,14 @@ class RelationMatrixBuilder:
                         while j < s_end and full_ids[j] != self.tok_id['FK_END']:
                             j += 1
                         if j >= s_end:
-                            logger.warning(f"Unclosed FK tag at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed FK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
                             i += 1
                             continue
                         payload = self._decode(full_ids[i+1:j])
                         if not payload:
-                            logger.warning(f"Empty FK payload at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty FK payload at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
                             i = j + 1
                             continue
-                            
                         ref_tbl, ref_col = None, None
                         if "->" in payload:
                             col_part, ref_part = [p.strip() for p in payload.split("->", 1)]
@@ -220,7 +227,6 @@ class RelationMatrixBuilder:
                                 ref_tbl, ref_col = [p.strip() for p in ref_part.split(".", 1)]
                         else:
                             col_part = payload
-                            
                         schema_tokens.append(SchemaToken(
                             span_start=i, span_end=j,
                             token_type='fk',
@@ -238,12 +244,11 @@ class RelationMatrixBuilder:
                 # Parse table or column
                 try:
                     piece = self._decode([tok])
-                    
                     # Table pattern: name followed by opening parenthesis
                     if "(" in piece:
                         table_name = piece.split("(")[0].strip()
                         if not table_name:
-                            logger.warning(f"Empty table name at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty table name at position {i}, skipping. Token ID: {tok} | Detok: '{piece}' | Schema region: {schema_region_ids}")
                             i += 1
                             continue
                         current_table = table_name
@@ -254,12 +259,11 @@ class RelationMatrixBuilder:
                         ))
                         i += 1
                         continue
-
                     # Column pattern: name followed by colon
                     if ":" in piece:
                         col_name = piece.split(":")[0].strip()
                         if not col_name:
-                            logger.warning(f"Empty column name at position {i}, skipping")
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty column name at position {i}, skipping. Token ID: {tok} | Detok: '{piece}' | Schema region: {schema_region_ids}")
                             i += 1
                             continue
                         schema_tokens.append(SchemaToken(
