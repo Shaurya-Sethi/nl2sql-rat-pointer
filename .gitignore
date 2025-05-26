@@ -89,3 +89,7 @@ dmypy.json
 .pyre/
 .pytype/
 cython_debug/
+
+# Others
+project-Transqlate-context.md
+inspect_tokenized_sft_data.py

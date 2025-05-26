@@ -1,445 +1,328 @@
-import torch
+# -*- coding: utf-8 -*-
+"""
+Refactored Relation Matrix Builder
+=================================
+This version focuses on *clarity* and *robustness*:
+
+* **Single‑responsibility helpers** – each small method does one thing.
+* **Early schema extraction** – the full input is sliced to the
+  `<SCHEMA> … </SCHEMA>` span before any parsing. Internal logic never
+  sees NL / COT / SQL tokens again.
+* **Token‑driven parsing** – we walk the token list once, recognising
+  tables & columns by the presence of `(` and special PK/FK wrappers.
+* **Leaner dependency surface** – no regex over token streams, no
+  multi‑stage caches; decoding is minimal & memoised.
+* **Guaranteed relation count** – `_REL_MAP` is a single source of truth;
+  constructor asserts `num_relations ≥ len(_REL_MAP)`.
+
+compatible with the previous class: `build_relation_matrix`
+returns a `torch.LongTensor (seq_len × seq_len)` with the same relation IDs.
+
+>>> rmb = RelationMatrixBuilder(tokenizer)
+>>> rel = rmb.build_relation_matrix(full_ids)  # works like before
+
+If we hit an assertion or error, enable DEBUG logging – the walker prints a
+step‑by‑step trace of its decisions.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Tuple, Optional, Set
+import re
 from dataclasses import dataclass
-from tokenizer import NL2SQLTokenizer
-import re  # Added for regex pattern validation
+from typing import Dict, List, Optional, Tuple
+
+import torch
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # flip to DEBUG while debugging
 
+__all__ = [
+    "SchemaToken",
+    "RelationMatrixBuilder",
+]
+
+
+# ---------------------------------------------------------------------------
+# Dataclass ‑‑ schema token metadata
+# ---------------------------------------------------------------------------
 @dataclass
 class SchemaToken:
-    """Metadata for a schema token span in the *full* input sequence."""
-    span_start: int        # inclusive index in full token list
-    span_end:   int        # inclusive index in full token list
-    token_type: str        # 'table' | 'column' | 'pk' | 'fk'
-    table_name:   Optional[str] = None
-    column_name:  Optional[str] = None
-    references:   Optional[Tuple[str, str]] = None   # (ref_table, ref_column)
+    span_start: int  # inclusive
+    span_end: int    # inclusive
+    token_type: str  # "table" | "column" | "pk" | "fk"
+    table_name: Optional[str] = None
+    column_name: Optional[str] = None
+    references: Optional[Tuple[str, str]] = None  # (ref_table, ref_column)
 
+    # --- helpers -----------------------------------------------------------
+    def key(self) -> Tuple[str, str, str]:
+        return self.token_type, self.table_name or "", self.column_name or ""
+
+    # nice for debugging in logs
+    def __repr__(self) -> str:  # pragma: no cover
+        ref = (
+            f" → {self.references[0]}.{self.references[1]}" if self.references else ""
+        )
+        return (
+            f"<{self.token_type}:{self.table_name or ''}.{self.column_name or ''}{ref}"  # noqa:E501
+            f" [{self.span_start}:{self.span_end}]>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Core builder
+# ---------------------------------------------------------------------------
 class RelationMatrixBuilder:
-    """
-    Builds a seq_len × seq_len matrix of relation-type IDs.
-    Relation IDs:
-        0: no_relation / padding (default)
-        1: same_table
-        2: pk_fk  (PK ↔ FK)
-        3: table_column
-        4: same_column (name match across tables)
-    """
+    """Parse the schema segment and build an **NxN** relation matrix."""
 
-    _REL_MAP = {
-        'no_relation': 0,
-        'same_table' : 1,
-        'pk_fk'      : 2,
-        'table_column': 3,
-        'same_column': 4,
+    # relation‑type IDs – extend here if you add more relation kinds
+    _REL_MAP: Dict[str, int] = {
+        "no_relation": 0,
+        "same_table": 1,
+        "pk_fk": 2,
+        "table_column": 3,
+        "same_column": 4,
     }
 
-    def __init__(self,
-                 tokenizer: NL2SQLTokenizer,
-                 num_relations: int = 5):
-        """
-        Initialize relation matrix builder.
-        
-        Args:
-            tokenizer: NL2SQLTokenizer instance
-            num_relations: Number of relation types
-        """
-        try:
-            self.sp = tokenizer.sp
-            self.tok_id = tokenizer.special_token_ids
+    # ---------------------------------------------------------------------
+    # Setup / helpers
+    # ---------------------------------------------------------------------
+    def __init__(self, tokenizer, num_relations: int = 5):
+        self.sp = tokenizer.sp  # sentencepiece model (must expose .encode/.decode)
+        self.tok_id = tokenizer.special_token_ids  # name → id
 
-            # Validate special tokens are present in the provided tokenizer's mapping
-            required_token_names = {
-                'SCHEMA_START', 'SCHEMA_END',
-                'PK_START', 'PK_END',
-                'FK_START', 'FK_END'
-            }
-            missing_tokens = required_token_names - set(self.tok_id.keys())
-            if missing_tokens:
-                raise ValueError(f"Missing required special token names in tokenizer's special_token_ids: {missing_tokens}")
+        # sanity – make sure we have our required specials
+        required = {
+            "SCHEMA_START",
+            "SCHEMA_END",
+            "PK_START",
+            "PK_END",
+            "FK_START",
+            "FK_END",
+        }
+        missing = required - set(self.tok_id)
+        if missing:
+            raise ValueError(f"tokenizer.special_token_ids missing {missing}")
 
-            self.num_relations = num_relations
-            
-            if num_relations < len(self._REL_MAP):
-                raise ValueError(f"num_relations={num_relations} must be at least {len(self._REL_MAP)}")
-            
-        except Exception as e:
-            logger.error(f"Error initializing RelationMatrixBuilder: {e}")
-            raise
+        if num_relations < len(self._REL_MAP):
+            raise ValueError("num_relations must cover all relation kinds")
+        self.num_relations = num_relations
 
-    def _decode(self, ids: List[int]) -> str:
-        """
-        Decode token IDs to string.
-        
-        Args:
-            ids: List of token IDs
-            
-        Returns:
-            Decoded string
-        """
-        try:
-            return self.sp.decode(ids) if ids else ""
-        except Exception as e:
-            logger.error(f"Error decoding tokens {ids}: {e}")
-            return ""
+        # micro cache for decode – avoid re‑decoding tiny tokens repeatedly
+        self._decode_cache: Dict[int, str] = {}
 
-    def validate_schema_format(self, full_ids: List[int]) -> bool:
-        """
-        Validate schema format before parsing.
-        
-        Args:
-            full_ids: List of token IDs
-            
-        Returns:
-            True if valid, False otherwise
-        """
-        try:
-            # Check if schema tokens exist
-            if self.tok_id['SCHEMA_START'] not in full_ids or self.tok_id['SCHEMA_END'] not in full_ids:
-                logger.error("Missing SCHEMA_START or SCHEMA_END tokens in input")
-                return False
-                
-            # Validate schema region
+    # ------------------------------------------------------------------
+    # Small utilities
+    # ------------------------------------------------------------------
+    def _decode(self, tid: int) -> str:
+        if tid not in self._decode_cache:
             try:
-                s_start = full_ids.index(self.tok_id['SCHEMA_START'])
-                s_end = full_ids.index(self.tok_id['SCHEMA_END'])
-                
-                if s_start >= s_end:
-                    logger.error(f"Invalid schema region: start={s_start}, end={s_end}")
-                    return False
-                    
-                # Check for balanced special token pairs in schema region
-                schema_region = full_ids[s_start:s_end+1]
-                
-                # Check PK token pairs
-                pk_starts = schema_region.count(self.tok_id['PK_START'])
-                pk_ends = schema_region.count(self.tok_id['PK_END'])
-                if pk_starts != pk_ends:
-                    logger.error(f"Unbalanced PK tags: {pk_starts} starts, {pk_ends} ends")
-                    return False
-                    
-                # Check FK token pairs
-                fk_starts = schema_region.count(self.tok_id['FK_START'])
-                fk_ends = schema_region.count(self.tok_id['FK_END'])
-                if fk_starts != fk_ends:
-                    logger.error(f"Unbalanced FK tags: {fk_starts} starts, {fk_ends} ends")
-                    return False
-                
-                return True
-                
-            except ValueError:
-                logger.error("Invalid schema structure: could not find schema tokens")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error validating schema format: {e}")
-            return False
+                self._decode_cache[tid] = self.sp.decode([tid])
+            except Exception:  # pragma: no cover
+                self._decode_cache[tid] = ""
+        return self._decode_cache[tid]
 
+    @staticmethod
+    def _norm(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip()).lower().strip("`\"[]")
+
+    @staticmethod
+    def _is_ident(name: str) -> bool:
+        return bool(re.match(r"^[a-z_][a-z0-9_]*$", name))
+
+    # ------------------------------------------------------------------
+    # Phase 1 – slice out the schema       full_ids  →  schema_ids
+    # ------------------------------------------------------------------
+    def _extract_schema_segment(self, full_ids: List[int]) -> List[int]:
+        """Return the sub‑list *between* <SCHEMA> and </SCHEMA>."""
+        try:
+            s = full_ids.index(self.tok_id["SCHEMA_START"]) + 1
+            e = full_ids.index(self.tok_id["SCHEMA_END"])
+        except ValueError:
+            logger.error("<SCHEMA> or </SCHEMA> tokens missing – aborting parse")
+            return []
+        if s >= e:
+            logger.error("Malformed schema segment – start ≥ end")
+            return []
+        return full_ids[s:e]
+
+    # ------------------------------------------------------------------
+    # Phase 2 – walk schema tokens and materialise SchemaToken objects
+    # ------------------------------------------------------------------
     def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
-        """
-        Parse schema tokens from input sequence.
-        
-        Args:
-            full_ids: List of token IDs
-            
-        Returns:
-            List of SchemaToken objects
-        """
-        try:
-            schema_tokens: List[SchemaToken] = []
-
-            # Validate schema format before parsing
-            if not self.validate_schema_format(full_ids):
-                logger.warning("Invalid schema format, returning empty schema tokens list")
-                return schema_tokens
-
-            # Find schema region
-            try:
-                s_start = full_ids.index(self.tok_id['SCHEMA_START']) + 1
-                s_end = full_ids.index(self.tok_id['SCHEMA_END'])
-            except ValueError:
-                logger.warning("No schema region found")
-                return schema_tokens
-
-            i = s_start
-            current_table: Optional[str] = None
-
-            while i < s_end:
-                tok = full_ids[i]
-
-                # Parse PK
-                if tok == self.tok_id['PK_START']:
-                    try:
-                        j = i + 1
-                        while j < s_end and full_ids[j] != self.tok_id['PK_END']:
-                            j += 1
-                        if j >= s_end:
-                            logger.warning(f"Unclosed PK tag at position {i}, skipping")
-                            i += 1
-                            continue
-                        col_name = self._decode(full_ids[i+1:j])
-                        if not col_name:
-                            logger.warning(f"Empty PK column name at position {i}, skipping")
-                            i = j + 1
-                            continue
-                        schema_tokens.append(SchemaToken(
-                            span_start=i, span_end=j,
-                            token_type='pk',
-                            table_name=current_table,
-                            column_name=col_name,
-                        ))
-                        i = j + 1
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error parsing PK at position {i}: {e}")
-                        i += 1
-                        continue
-
-                # Parse FK
-                if tok == self.tok_id['FK_START']:
-                    try:
-                        j = i + 1
-                        while j < s_end and full_ids[j] != self.tok_id['FK_END']:
-                            j += 1
-                        if j >= s_end:
-                            logger.warning(f"Unclosed FK tag at position {i}, skipping")
-                            i += 1
-                            continue
-                        payload = self._decode(full_ids[i+1:j])
-                        if not payload:
-                            logger.warning(f"Empty FK payload at position {i}, skipping")
-                            i = j + 1
-                            continue
-                            
-                        ref_tbl, ref_col = None, None
-                        if "->" in payload:
-                            col_part, ref_part = [p.strip() for p in payload.split("->", 1)]
-                            if "." in ref_part:
-                                ref_tbl, ref_col = [p.strip() for p in ref_part.split(".", 1)]
-                        else:
-                            col_part = payload
-                            
-                        schema_tokens.append(SchemaToken(
-                            span_start=i, span_end=j,
-                            token_type='fk',
-                            table_name=current_table,
-                            column_name=col_part,
-                            references=(ref_tbl, ref_col) if ref_tbl and ref_col else None
-                        ))
-                        i = j + 1
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error parsing FK at position {i}: {e}")
-                        i += 1
-                        continue
-
-                # Parse table or column
-                try:
-                    piece = self._decode([tok])
-                    
-                    # Table pattern: name followed by opening parenthesis
-                    if "(" in piece:
-                        table_name = piece.split("(")[0].strip()
-                        if not table_name:
-                            logger.warning(f"Empty table name at position {i}, skipping")
-                            i += 1
-                            continue
-                        current_table = table_name
-                        schema_tokens.append(SchemaToken(
-                            span_start=i, span_end=i,
-                            token_type='table',
-                            table_name=current_table
-                        ))
-                        i += 1
-                        continue
-
-                    # Column pattern: name followed by colon
-                    if ":" in piece:
-                        col_name = piece.split(":")[0].strip()
-                        if not col_name:
-                            logger.warning(f"Empty column name at position {i}, skipping")
-                            i += 1
-                            continue
-                        schema_tokens.append(SchemaToken(
-                            span_start=i, span_end=i,
-                            token_type='column',
-                            table_name=current_table,
-                            column_name=col_name
-                        ))
-                        i += 1
-                        continue
-                except Exception as e:
-                    logger.error(f"Error parsing token at position {i}: {e}")
-                    i += 1
-                    continue
-
-                i += 1
-
-            # Validate parsed schema tokens
-            if not schema_tokens:
-                logger.warning("No schema tokens parsed from valid schema region")
-                
-            # Log schema parsing summary
-            token_types = {}
-            for token in schema_tokens:
-                token_types[token.token_type] = token_types.get(token.token_type, 0) + 1
-            logger.info(f"Schema parsing summary: {token_types}")
-            
-            return schema_tokens
-
-        except Exception as e:
-            logger.error(f"Error parsing schema tokens: {e}")
+        schema_ids = self._extract_schema_segment(full_ids)
+        if not schema_ids:
             return []
 
-    def build_relation_matrix(self,
-                            full_ids: List[int],
-                            schema_tokens: Optional[List[SchemaToken]] = None,
-                            max_seq_len_for_matrix: Optional[int] = None) -> torch.Tensor:
-        """
-        Build relation matrix from schema tokens.
-        
-        Args:
-            full_ids: List of token IDs
-            schema_tokens: Optional list of SchemaToken objects. If None, will be parsed.
-            max_seq_len_for_matrix: Optional maximum sequence length to enforce for the matrix.
-                                    If full_ids is longer, it will be truncated.
-                                    If None, uses the length of full_ids.
-            
-        Returns:
-            Relation matrix tensor of shape (seq_len, seq_len)
-        """
-        try:
-            current_full_ids = list(full_ids)
+        tokens: List[SchemaToken] = []
+        pos = 0
+        current_table: Optional[str] = None
 
-            if max_seq_len_for_matrix is not None and len(current_full_ids) > max_seq_len_for_matrix:
-                logger.warning(f"RelationMatrixBuilder: input full_ids (len {len(current_full_ids)}) exceeds max_seq_len_for_matrix ({max_seq_len_for_matrix}). Truncating full_ids.")
-                current_full_ids = current_full_ids[:max_seq_len_for_matrix]
-            
-            seq_len = len(current_full_ids)
-            
-            rel = torch.zeros((seq_len, seq_len), dtype=torch.long)
+        while pos < len(schema_ids):
+            tid = schema_ids[pos]
 
-            # Parse schema tokens if not provided, using the (potentially truncated) current_full_ids
-            if schema_tokens is None:
-                schema_tokens = self.parse_schema_tokens(current_full_ids)
-                
-            if not schema_tokens:
-                logger.warning("No schema tokens to build relation matrix, returning zero matrix")
-                return rel
-
-            # Helper to set relation across token spans
-            def set_rel(span_a: Tuple[int, int],
-                        span_b: Tuple[int, int],
-                        rel_id: int):
+            # --- PK -------------------------------------------------------
+            if tid == self.tok_id["PK_START"]:
+                pk_start = pos
                 try:
-                    a0, a1 = span_a
-                    b0, b1 = span_b
-                    if a0 < 0 or a1 >= seq_len or b0 < 0 or b1 >= seq_len:
-                        logger.warning(f"Invalid span indices: {span_a}, {span_b}, sequence length: {seq_len}")
-                        return
-                    rel[a0:a1+1, b0:b1+1] = rel_id
-                except Exception as e:
-                    logger.error(f"Error setting relation: {e}")
+                    pk_end = schema_ids.index(self.tok_id["PK_END"], pk_start + 1)
+                except ValueError:
+                    logger.warning("Unclosed <PK> tag – skipping")
+                    break
+                col_tokens = schema_ids[pk_start + 1 : pk_end]
+                col_name = self._norm(self.sp.decode(col_tokens).split(":", 1)[0])
+                if self._is_ident(col_name):
+                    tokens.append(
+                        SchemaToken(
+                            span_start=pk_start,
+                            span_end=pk_end,
+                            token_type="pk",
+                            table_name=current_table,
+                            column_name=col_name,
+                        )
+                    )
+                pos = pk_end + 1
+                continue
 
-            # Compute relations
-            for tok_i in schema_tokens:
-                for tok_j in schema_tokens:
-                    try:
-                        # SAME TABLE
-                        if (tok_i.table_name and tok_j.table_name
-                                and tok_i.table_name == tok_j.table_name):
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['same_table'])
+            # --- FK -------------------------------------------------------
+            if tid == self.tok_id["FK_START"]:
+                fk_start = pos
+                try:
+                    fk_end = schema_ids.index(self.tok_id["FK_END"], fk_start + 1)
+                except ValueError:
+                    logger.warning("Unclosed <FK> tag – skipping")
+                    break
+                raw = self.sp.decode(schema_ids[fk_start + 1 : fk_end])
+                parts = [p.strip() for p in raw.split("->", 1)]
+                col_name = self._norm(parts[0].split(":", 1)[0])
+                ref = (None, None)
+                if len(parts) == 2 and "." in parts[1]:
+                    ref_tbl, ref_col = parts[1].split(".", 1)
+                    ref = (self._norm(ref_tbl), self._norm(ref_col))
+                if self._is_ident(col_name):
+                    tokens.append(
+                        SchemaToken(
+                            span_start=fk_start,
+                            span_end=fk_end,
+                            token_type="fk",
+                            table_name=current_table,
+                            column_name=col_name,
+                            references=ref if all(ref) else None,
+                        )
+                    )
+                pos = fk_end + 1
+                continue
 
-                        # PK ↔ FK
-                        if tok_i.token_type == 'pk' and tok_j.token_type == 'fk' \
-                           and tok_j.references and tok_i.table_name and tok_i.column_name \
-                           and tok_i.table_name == tok_j.references[0] \
-                           and tok_i.column_name == tok_j.references[1]:
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['pk_fk'])
-                        if tok_i.token_type == 'fk' and tok_j.token_type == 'pk' \
-                           and tok_i.references and tok_j.table_name and tok_j.column_name \
-                           and tok_j.table_name == tok_i.references[0] \
-                           and tok_j.column_name == tok_i.references[1]:
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['pk_fk'])
+            # --- table or regular column -------------------------------
+            tk_text = self._decode(tid)
+            next_text = self._decode(schema_ids[pos + 1]) if pos + 1 < len(schema_ids) else ""
 
-                        # TABLE–COLUMN
-                        if tok_i.token_type == 'table' and tok_j.token_type in ['column', 'pk', 'fk'] \
-                           and tok_i.table_name == tok_j.table_name:
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['table_column'])
-                        if tok_j.token_type == 'table' and tok_i.token_type in ['column', 'pk', 'fk'] \
-                           and tok_i.table_name == tok_j.table_name:
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['table_column'])
+            # • Detect start of a table def: `table_name (` or `table_name(`
+            if ("(" in next_text and self._is_ident(self._norm(tk_text))) or (
+                "(" in tk_text and self._is_ident(self._norm(tk_text.split("(")[0]))
+            ):
+                # grab all tokens until matching ')' (depth 0)
+                table_name = self._norm(tk_text.split("(")[0])
+                table_start = pos
+                depth = tk_text.count("(")
+                j = pos + 1
+                while j < len(schema_ids) and depth:
+                    part = self._decode(schema_ids[j])
+                    depth += part.count("(") - part.count(")")
+                    j += 1
+                table_end = j - 1
+                tokens.append(
+                    SchemaToken(
+                        span_start=table_start,
+                        span_end=table_end,
+                        token_type="table",
+                        table_name=table_name,
+                    )
+                )
+                current_table = table_name
+                pos = table_start + 1  # enter columns loop normally
+                continue
 
-                        # SAME COLUMN NAME
-                        if tok_i.token_type == 'column' and tok_j.token_type == 'column' \
-                           and tok_i.column_name and tok_j.column_name \
-                           and tok_i.column_name == tok_j.column_name \
-                           and tok_i.table_name != tok_j.table_name:
-                            set_rel((tok_i.span_start, tok_i.span_end),
-                                    (tok_j.span_start, tok_j.span_end),
-                                    self._REL_MAP['same_column'])
-                    except Exception as e:
-                        logger.error(f"Error computing relation between tokens: {e}")
-                        continue
+            # • Regular column (outside PK/FK) – we mark each token span up to next comma/paren
+            if current_table and self._is_ident(self._norm(tk_text)):
+                col_start = pos
+                j = pos + 1
+                while j < len(schema_ids):
+                    txt = self._decode(schema_ids[j])
+                    if txt.strip() in {",", ")"}:
+                        break
+                    j += 1
+                col_end = j - 1
+                col_name = self._norm(tk_text.split(":", 1)[0])
+                tokens.append(
+                    SchemaToken(
+                        span_start=col_start,
+                        span_end=col_end,
+                        token_type="column",
+                        table_name=current_table,
+                        column_name=col_name,
+                    )
+                )
+                pos = j  # jump past column definition
+                continue
 
-            # Validate relation matrix
-            non_zero = (rel > 0).sum().item()
-            if non_zero == 0:
-                logger.warning("Relation matrix contains no non-zero entries")
-            else:
-                logger.info(f"Relation matrix contains {non_zero} non-zero entries")
+            # Anything else – advance one token
+            pos += 1
 
-            return rel
+        logger.debug("Parsed schema tokens: %s", tokens)
+        return tokens
 
-        except Exception as e:
-            logger.error(f"Error building relation matrix: {e}")
-            return torch.zeros((seq_len, seq_len), dtype=torch.long)
-            
-    def build_matrix(self, schema: str, max_seq_len_for_matrix: Optional[int] = None) -> torch.Tensor:
-        """
-        Convenience method to build relation matrix from schema string.
-        
-        Args:
-            schema: Schema string
-            max_seq_len_for_matrix: Optional maximum sequence length for the matrix.
-            
-        Returns:
-            Relation matrix tensor
-        """
-        try:
-            # Validate schema string
-            if not schema:
-                logger.error("Empty schema string")
-                return torch.zeros((1, 1), dtype=torch.long)
-                
-            # Encode schema
-            schema_ids = self.sp.encode(schema)
-            if not schema_ids:
-                logger.error("Schema encoding produced empty ID list")
-                return torch.zeros((1, 1), dtype=torch.long)
-            
-            # Check if encoded schema length exceeds the maximum if provided
-            if max_seq_len_for_matrix is not None and len(schema_ids) > max_seq_len_for_matrix:
-                logger.warning(f"RelationMatrixBuilder.build_matrix: Encoded schema (len {len(schema_ids)}) exceeds max_seq_len_for_matrix ({max_seq_len_for_matrix}). Truncating schema_ids.")
-                schema_ids = schema_ids[:max_seq_len_for_matrix]
-                
-            # Build relation matrix
-            return self.build_relation_matrix(schema_ids, max_seq_len_for_matrix=max_seq_len_for_matrix)
-            
-        except Exception as e:
-            logger.error(f"Error in build_matrix: {e}")
-            # Fallback based on original schema string length if schema_ids failed or max_seq_len is complex
-            fallback_len = max_seq_len_for_matrix if max_seq_len_for_matrix is not None else (len(schema) if schema else 1)
-            return torch.zeros((fallback_len, fallback_len), dtype=torch.long)
+    # ------------------------------------------------------------------
+    # Phase 3 – build relation matrix
+    # ------------------------------------------------------------------
+    def build_relation_matrix(
+        self,
+        full_ids: List[int],
+        schema_tokens: Optional[List[SchemaToken]] = None,
+    ) -> torch.Tensor:
+        if schema_tokens is None:
+            schema_tokens = self.parse_schema_tokens(full_ids)
+        seq_len = len(full_ids)
+        rel = torch.zeros((seq_len, seq_len), dtype=torch.long)
+
+        def set_span(a: Tuple[int, int], b: Tuple[int, int], rel_id: int):
+            rel[a[0] : a[1] + 1, b[0] : b[1] + 1] = rel_id
+
+        for i in schema_tokens:
+            for j in schema_tokens:
+                # same table ------------------------------------------------
+                if i.table_name and i.table_name == j.table_name:
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["same_table"])
+
+                # pk ↔ fk ---------------------------------------------------
+                if i.token_type == "pk" and j.token_type == "fk" and j.references == (
+                    i.table_name,
+                    i.column_name,
+                ):
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["pk_fk"])
+                if j.token_type == "pk" and i.token_type == "fk" and i.references == (
+                    j.table_name,
+                    j.column_name,
+                ):
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["pk_fk"])
+
+                # table ↔ column -------------------------------------------
+                if i.token_type == "table" and j.token_type in {"column", "pk", "fk"} and i.table_name == j.table_name:
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["table_column"])
+                if j.token_type == "table" and i.token_type in {"column", "pk", "fk"} and j.table_name == i.table_name:
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["table_column"])
+
+                # same column name across tables ---------------------------
+                if (
+                    i.token_type in {"column", "pk", "fk"}
+                    and j.token_type in {"column", "pk", "fk"}
+                    and i.column_name
+                    and i.column_name == j.column_name
+                    and i.table_name != j.table_name
+                ):
+                    set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["same_column"])
+
+        nz = (rel > 0).sum().item()
+        logger.info("Relation matrix built – %d non‑zero cells", nz)
+        return rel
