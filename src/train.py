@@ -137,12 +137,7 @@ def main():
 
     # Handle pointer_generator for pretraining phase
     if args.phase == 'pretrain' and model_config.use_pointer_generator:
-        logger.warning(
-            "Pointer-generator is enabled in config but current phase is 'pretrain'. "
-            "PretrainingDataset does not support schema_mask required by pointer-generator. "
-            "Forcing use_pointer_generator to False for pretraining."
-        )
-        model_config.use_pointer_generator = False
+        logger.info("Pointer-generator is enabled for pretraining. PretrainingDataset will supply dummy schema_mask. Ensure compatibility in downstream SFT.")
 
     # Initialize tokenizer
     try:
@@ -371,6 +366,19 @@ def main():
             train_metrics = trainer.train_epoch() # This will iterate through train_loader
             logger.info(f"Epoch {trainer.epoch} Training Summary: Train Loss: {train_metrics.get('train_loss', float('nan')):.4f}")
 
+            # ====== CUSTOM LEARNING RATE SCHEDULE ======
+            if current_epoch == 0:
+                new_lr = 1e-4
+            elif current_epoch == 1:
+                new_lr = 3e-5
+            else:
+                new_lr = 1e-6
+
+            for param_group in trainer.optimizer.param_groups:
+                param_group['lr'] = new_lr
+            logger.info(f"Set learning rate to {new_lr} at end of epoch {current_epoch}")
+            # ====== END CUSTOM LR SCHEDULE ======
+
             if training_interrupted:
                 logger.info("Training interrupted after train_epoch. Saving checkpoint and exiting.")
                 break # Exit before validation if interrupted
@@ -461,4 +469,4 @@ def main():
              sys.exit(130) # Exit code for Ctrl+C
 
 if __name__ == '__main__':
-    main() 
+    main()
