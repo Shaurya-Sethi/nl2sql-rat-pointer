@@ -137,173 +137,173 @@ class RelationMatrixBuilder:
             logger.error(f"Error validating schema format: {e}")
             return False
 
-def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
-    """
-    Parse schema tokens from input sequence.
+    def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
+        """
+        Parse schema tokens from input sequence.
 
-    Args:
-        full_ids: List of token IDs
+        Args:
+            full_ids: List of token IDs
 
-    Returns:
-        List of SchemaToken objects
-    """
-    try:
-        schema_tokens: List[SchemaToken] = []
-
-        # Validate schema format before parsing
-        if not self.validate_schema_format(full_ids):
-            logger.warning("Invalid schema format, returning empty schema tokens list")
-            return schema_tokens
-
-        # Find schema region
+        Returns:
+            List of SchemaToken objects
+        """
         try:
-            s_start = full_ids.index(self.tok_id['SCHEMA_START']) + 1
-            s_end = full_ids.index(self.tok_id['SCHEMA_END'])
-        except ValueError:
-            logger.warning("No schema region found")
-            return schema_tokens
+            schema_tokens: List[SchemaToken] = []
 
-        schema_region_ids = full_ids[s_start:s_end]
-        try:
-            detok_schema_region = self._decode(schema_region_ids)
-        except Exception as e:
-            detok_schema_region = f"<decode error: {e}>"
-        logger.warning(f"[SCHEMA_PARSE_DEBUG] Schema region token IDs: {schema_region_ids}")
-        logger.warning(f"[SCHEMA_PARSE_DEBUG] Detokenized schema region: '{detok_schema_region}'")
+            # Validate schema format before parsing
+            if not self.validate_schema_format(full_ids):
+                logger.warning("Invalid schema format, returning empty schema tokens list")
+                return schema_tokens
 
-        i = s_start
-        current_table: Optional[str] = None
-
-        while i < s_end:
-            tok = full_ids[i]
-
-            # Parse PK
-            if tok == self.tok_id['PK_START']:
-                try:
-                    j = i + 1
-                    while j < s_end and full_ids[j] != self.tok_id['PK_END']:
-                        j += 1
-                    if j >= s_end:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed PK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
-                        i += 1
-                        continue
-                    col_name = self._decode(full_ids[i+1:j])
-                    if not col_name:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty PK column name at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
-                        i = j + 1
-                        continue
-                    schema_tokens.append(SchemaToken(
-                        span_start=i, span_end=j,
-                        token_type='pk',
-                        table_name=current_table,
-                        column_name=col_name,
-                    ))
-                    i = j + 1
-                    continue
-                except Exception as e:
-                    logger.error(f"Error parsing PK at position {i}: {e}")
-                    i += 1
-                    continue
-
-            # Parse FK
-            if tok == self.tok_id['FK_START']:
-                try:
-                    j = i + 1
-                    while j < s_end and full_ids[j] != self.tok_id['FK_END']:
-                        j += 1
-                    if j >= s_end:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed FK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
-                        i += 1
-                        continue
-                    payload = self._decode(full_ids[i+1:j])
-                    if not payload:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty FK payload at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
-                        i = j + 1
-                        continue
-                    ref_tbl, ref_col = None, None
-                    if "->" in payload:
-                        col_part, ref_part = [p.strip() for p in payload.split("->", 1)]
-                        if "." in ref_part:
-                            ref_tbl, ref_col = [p.strip() for p in ref_part.split(".", 1)]
-                    else:
-                        col_part = payload
-                    schema_tokens.append(SchemaToken(
-                        span_start=i, span_end=j,
-                        token_type='fk',
-                        table_name=current_table,
-                        column_name=col_part,
-                        references=(ref_tbl, ref_col) if ref_tbl and ref_col else None
-                    ))
-                    i = j + 1
-                    continue
-                except Exception as e:
-                    logger.error(f"Error parsing FK at position {i}: {e}")
-                    i += 1
-                    continue
-
-            # PATCH: Robust multi-token table name extraction
+            # Find schema region
             try:
-                piece = self._decode([tok])
-                # NEW TABLE LOGIC: gather tokens until one contains '('
-                if "(" in piece or piece == "(":
-                    t_start = i
-                    table_tokens = []
-                    j = i
-                    while j < s_end:
-                        part = self._decode([full_ids[j]])
-                        table_tokens.append(part)
-                        if "(" in part:
-                            break
-                        j += 1
-                    table_name = "".join(table_tokens).split("(", 1)[0].strip()
-                    if table_name:
-                        current_table = table_name
+                s_start = full_ids.index(self.tok_id['SCHEMA_START']) + 1
+                s_end = full_ids.index(self.tok_id['SCHEMA_END'])
+            except ValueError:
+                logger.warning("No schema region found")
+                return schema_tokens
+
+            schema_region_ids = full_ids[s_start:s_end]
+            try:
+                detok_schema_region = self._decode(schema_region_ids)
+            except Exception as e:
+                detok_schema_region = f"<decode error: {e}>"
+            logger.warning(f"[SCHEMA_PARSE_DEBUG] Schema region token IDs: {schema_region_ids}")
+            logger.warning(f"[SCHEMA_PARSE_DEBUG] Detokenized schema region: '{detok_schema_region}'")
+
+            i = s_start
+            current_table: Optional[str] = None
+
+            while i < s_end:
+                tok = full_ids[i]
+
+                # Parse PK
+                if tok == self.tok_id['PK_START']:
+                    try:
+                        j = i + 1
+                        while j < s_end and full_ids[j] != self.tok_id['PK_END']:
+                            j += 1
+                        if j >= s_end:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed PK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
+                            i += 1
+                            continue
+                        col_name = self._decode(full_ids[i+1:j])
+                        if not col_name:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty PK column name at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
+                            i = j + 1
+                            continue
                         schema_tokens.append(SchemaToken(
-                            span_start=t_start, span_end=j,
-                            token_type='table',
-                            table_name=current_table
+                            span_start=i, span_end=j,
+                            token_type='pk',
+                            table_name=current_table,
+                            column_name=col_name,
                         ))
-                    else:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty table name at position {t_start}-{j}, skipping. Token IDs: {full_ids[t_start:j+1]} | Detok: '{''.join(table_tokens)}'")
-                    i = j + 1
-                    continue
-                # Column pattern: name followed by colon
-                if ":" in piece:
-                    col_name = piece.split(":", 1)[0].strip()
-                    if not col_name:
-                        logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty column name at position {i}, skipping. Token ID: {tok} | Detok: '{piece}' | Schema region: {schema_region_ids}")
+                        i = j + 1
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error parsing PK at position {i}: {e}")
                         i += 1
                         continue
-                    schema_tokens.append(SchemaToken(
-                        span_start=i, span_end=i,
-                        token_type='column',
-                        table_name=current_table,
-                        column_name=col_name
-                    ))
+
+                # Parse FK
+                if tok == self.tok_id['FK_START']:
+                    try:
+                        j = i + 1
+                        while j < s_end and full_ids[j] != self.tok_id['FK_END']:
+                            j += 1
+                        if j >= s_end:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Unclosed FK tag at position {i}, skipping. Schema segment: {full_ids[i:j+3]} | Detok: '{self._decode(full_ids[i:j+3])}'")
+                            i += 1
+                            continue
+                        payload = self._decode(full_ids[i+1:j])
+                        if not payload:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty FK payload at position {i}, skipping. Token IDs: {full_ids[i:j]} | Detok: '{self._decode(full_ids[i:j])}'")
+                            i = j + 1
+                            continue
+                        ref_tbl, ref_col = None, None
+                        if "->" in payload:
+                            col_part, ref_part = [p.strip() for p in payload.split("->", 1)]
+                            if "." in ref_part:
+                                ref_tbl, ref_col = [p.strip() for p in ref_part.split(".", 1)]
+                        else:
+                            col_part = payload
+                        schema_tokens.append(SchemaToken(
+                            span_start=i, span_end=j,
+                            token_type='fk',
+                            table_name=current_table,
+                            column_name=col_part,
+                            references=(ref_tbl, ref_col) if ref_tbl and ref_col else None
+                        ))
+                        i = j + 1
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error parsing FK at position {i}: {e}")
+                        i += 1
+                        continue
+
+                # PATCH: Robust multi-token table name extraction
+                try:
+                    piece = self._decode([tok])
+                    # NEW TABLE LOGIC: gather tokens until one contains '('
+                    if "(" in piece or piece == "(":
+                        t_start = i
+                        table_tokens = []
+                        j = i
+                        while j < s_end:
+                            part = self._decode([full_ids[j]])
+                            table_tokens.append(part)
+                            if "(" in part:
+                                break
+                            j += 1
+                        table_name = "".join(table_tokens).split("(", 1)[0].strip()
+                        if table_name:
+                            current_table = table_name
+                            schema_tokens.append(SchemaToken(
+                                span_start=t_start, span_end=j,
+                                token_type='table',
+                                table_name=current_table
+                            ))
+                        else:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty table name at position {t_start}-{j}, skipping. Token IDs: {full_ids[t_start:j+1]} | Detok: '{''.join(table_tokens)}'")
+                        i = j + 1
+                        continue
+                    # Column pattern: name followed by colon
+                    if ":" in piece:
+                        col_name = piece.split(":", 1)[0].strip()
+                        if not col_name:
+                            logger.warning(f"[SCHEMA_PARSE_DEBUG] Empty column name at position {i}, skipping. Token ID: {tok} | Detok: '{piece}' | Schema region: {schema_region_ids}")
+                            i += 1
+                            continue
+                        schema_tokens.append(SchemaToken(
+                            span_start=i, span_end=i,
+                            token_type='column',
+                            table_name=current_table,
+                            column_name=col_name
+                        ))
+                        i += 1
+                        continue
+                except Exception as e:
+                    logger.error(f"Error parsing token at position {i}: {e}")
                     i += 1
                     continue
-            except Exception as e:
-                logger.error(f"Error parsing token at position {i}: {e}")
+
                 i += 1
-                continue
 
-            i += 1
+            # Validate parsed schema tokens
+            if not schema_tokens:
+                logger.warning("No schema tokens parsed from valid schema region")
 
-        # Validate parsed schema tokens
-        if not schema_tokens:
-            logger.warning("No schema tokens parsed from valid schema region")
+            # Log schema parsing summary
+            token_types = {}
+            for token in schema_tokens:
+                token_types[token.token_type] = token_types.get(token.token_type, 0) + 1
+            logger.info(f"Schema parsing summary: {token_types}")
 
-        # Log schema parsing summary
-        token_types = {}
-        for token in schema_tokens:
-            token_types[token.token_type] = token_types.get(token.token_type, 0) + 1
-        logger.info(f"Schema parsing summary: {token_types}")
+            return schema_tokens
 
-        return schema_tokens
-
-    except Exception as e:
-        logger.error(f"Error parsing schema tokens: {e}")
-        return []
+        except Exception as e:
+            logger.error(f"Error parsing schema tokens: {e}")
+            return []
 
     def build_relation_matrix(self,
                             full_ids: List[int],
