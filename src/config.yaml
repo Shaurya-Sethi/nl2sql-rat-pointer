@@ -36,7 +36,7 @@ pretrain:
   # ---------- data ----------------------------------- #
   train_file:  "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_train.txt"
   eval_file:   "src/datasets/raw_sql/pretraining corpus/splits/wrapped_tokenized_corpus_val.txt"
-  epochs:      3 
+  epochs:      4 
   max_len:     512
 
   # ---------- batch / accumulation ------------------- #
@@ -50,14 +50,14 @@ pretrain:
   warmup_steps:    2500
   max_steps:       46875
   weight_decay:    0.01
-  max_grad_norm:   0.3           # reduced from 0.5 -> more aggressive clipping for second epoch
+  max_grad_norm:   0.3           # reduced from 0.5 -> more aggressive clipping
 
   # ---------- runtime -------------------------------- #
   mixed_precision:        true     # fp16/ bf16 autocast
-  bf16:                   true      # L4 supports bf16; gives more headroom
+  bf16:                   true     # L4 supports bf16; gives more headroom
   use_8bit_optimizer:     true
   gradient_checkpointing: true
-  save_steps:             2000
+  save_steps:             1        # Save a checkpoint after every epoch
   num_workers:            4
   early_stopping_patience: null
 
@@ -89,7 +89,7 @@ sft:
   bf16:                   true     # enable bf16 for extra VRAM savings
   use_8bit_optimizer:     true
   gradient_checkpointing: true
-  save_steps:             1000
+  save_steps:             1
   num_workers:            4
   early_stopping_patience: 3
 
