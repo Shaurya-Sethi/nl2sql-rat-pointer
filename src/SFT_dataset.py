@@ -315,14 +315,15 @@ class SFTDataset(Dataset):
                 schema_tokens = []
 
             try:
-                schema_meta = self.relation_builder.parse_schema_tokens(schema_tokens)
-                if not schema_meta:
-                    logger.debug(f"SFTDataset [EX {idx}]: No schema tokens parsed for PG from encoder input. PG copy may be ineffective. Input: {schema_tokens[:50]}")
-                
+                # Parse directly from the full encoder sequence so spans match
+                schema_meta = self.relation_builder.parse_schema_tokens(
+                    final_encoder_input_tokens
+                )
+                # Let the builder use the pre-parsed tokens (or omit the arg to
+                # have it re-parse internally)
                 relation_matrix = self.relation_builder.build_relation_matrix(
-                    final_encoder_input_tokens,  # Still size of encoder input!
-                    schema_meta,
-                    max_seq_len_for_matrix=relation_matrix_dim
+                    final_encoder_input_tokens,
+                    schema_meta,          # ← optional but keeps one parse
                 )
                 
                 for token_s in schema_meta:
