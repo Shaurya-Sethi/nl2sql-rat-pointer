@@ -24,77 +24,80 @@ def validate_batch(batch: Dict[str, torch.Tensor], config: NL2SQLConfig) -> bool
         if missing_keys:
             logger.error(f"Missing required keys in batch: {missing_keys}")
             return False
-            
-        # Get batch size and sequence length
+
         batch_size = batch['encoder_input'].size(0)
-        seq_len = batch['encoder_input'].size(1)
-        
-        # Validate shapes
+        enc_seq_len = batch['encoder_input'].size(1)
+        dec_seq_len = batch['decoder_target'].size(1)
+
+        # Encoder-side shapes
         expected_shapes = {
-            'encoder_input': (batch_size, seq_len),
-            'decoder_target': (batch_size, seq_len),
-            'relation_matrix': (batch_size, seq_len, seq_len),
-            'encoder_attention_mask': (batch_size, seq_len)
+            'encoder_input': (batch_size, enc_seq_len),
+            'relation_matrix': (batch_size, enc_seq_len, enc_seq_len),
+            'encoder_attention_mask': (batch_size, enc_seq_len)
         }
-        
         for key, expected_shape in expected_shapes.items():
             if batch[key].shape != expected_shape:
                 logger.error(f"Invalid shape for {key}: got {batch[key].shape}, expected {expected_shape}")
                 return False
-                
-        # Validate dtypes
+
+        # Decoder target can have any length >=2 (start + one target token minimum)
+        if batch['decoder_target'].shape[0] != batch_size or dec_seq_len < 2:
+            logger.error(f"Invalid shape for decoder_target: got {batch['decoder_target'].shape}, expected (batch_size, >=2)")
+            return False
+
+        # Dtype checks (unchanged)
         expected_dtypes = {
             'encoder_input': torch.long,
             'decoder_target': torch.long,
             'relation_matrix': torch.long,
             'encoder_attention_mask': torch.bool
         }
-        
         for key, expected_dtype in expected_dtypes.items():
             if batch[key].dtype != expected_dtype:
                 logger.error(f"Invalid dtype for {key}: got {batch[key].dtype}, expected {expected_dtype}")
                 return False
-                
-        # Validate values
+
+        # Value checks (as before)
         if batch['encoder_input'].min() < 0 or batch['encoder_input'].max() >= config.vocab_size:
             logger.error(f"encoder_input values out of range [0, {config.vocab_size})")
             return False
-            
+
         if batch['decoder_target'].min() < 0 or batch['decoder_target'].max() >= config.vocab_size:
             logger.error(f"decoder_target values out of range [0, {config.vocab_size})")
             return False
-            
+
         if batch['relation_matrix'].min() < 0 or batch['relation_matrix'].max() >= config.num_relations:
             logger.error(f"relation_matrix values out of range [0, {config.num_relations})")
             return False
-            
-        # Validate attention mask
+
+        # Validate attention mask (unchanged)
         if not batch['encoder_attention_mask'].any():
             logger.error("All positions masked in encoder_attention_mask")
             return False
-            
-        # Validate padding
+
+        # Padding checks (unchanged)
         pad_mask = ~batch['encoder_attention_mask']
         if (batch['encoder_input'][pad_mask] != 18).any():
             logger.error("Non-pad tokens in padded positions")
             return False
-            
+
         if (batch['relation_matrix'][pad_mask] != 0).any():
             logger.error("Non-zero relations in padded positions")
             return False
-            
-        # Validate sequence lengths
-        if seq_len > config.max_len:
-            logger.error(f"Sequence length {seq_len} exceeds maximum {config.max_len}")
+
+        # Sequence length/batch size checks for encoder_input only
+        if enc_seq_len > config.max_len:
+            logger.error(f"Sequence length {enc_seq_len} exceeds maximum {config.max_len}")
             return False
-            
-        # Validate batch size
+
         if batch_size > config.max_batch_size:
             logger.error(f"Batch size {batch_size} exceeds maximum {config.max_batch_size}")
             return False
-            
+
+        # No check for decoder_target seq_len matching encoder_input seq_len!
+
         return True
-        
+
     except Exception as e:
         logger.error(f"Error during batch validation: {e}")
         return False
@@ -261,4 +264,4 @@ def validate_metrics(metrics: Dict[str, float]) -> bool:
         
     except Exception as e:
         logger.error(f"Error during metrics validation: {e}")
-        return False 
+        return False
