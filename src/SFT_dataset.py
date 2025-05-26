@@ -359,82 +359,69 @@ class SFTDataset(Dataset):
         }
 
     @staticmethod
-    def collate_fn(batch, pad_id=18): # Default pad_id as per user context if not passed from DataLoader
+    def collate_fn(batch, pad_id=18):
+        """
+        Collate function for SFTDataset. Pads and batches items, handling edge cases robustly.
+        - Filters out None items and invalid dicts.
+        - Skips items with empty encoder_input.
+        - Always ensures decoder_target has at least length 1 (prevents shape errors).
+        - Pads all fields to batch max lengths.
+        """
         original_batch_len = len(batch)
         # 1. Filter out None items (samples dropped by __getitem__)
         batch = [item for item in batch if item is not None]
-        
         if not batch:
             if original_batch_len > 0:
-                 logger.warning("SFTDataset.collate_fn: Batch is empty after __getitem__ filtering. Skipping this batch.")
+                logger.warning("SFTDataset.collate_fn: Batch is empty after __getitem__ filtering. Skipping this batch.")
             return None 
 
-        # 2. Lightweight guard: Filter items if encoder_input is empty (should be rare due to __getitem__ checks)
-        #    Also check for empty decoder_target if it implies an invalid sample for the model.
-        
+        # 2. Filter out items with missing/invalid keys or empty encoder_input
         processed_batch = []
         for i, item in enumerate(batch):
             if not isinstance(item, dict) or 'encoder_input' not in item or 'decoder_target' not in item:
                 logger.warning(f"SFTDataset.collate_fn: Item {i} is not a valid dict or missing keys. Skipping. Item: {str(item)[:100]}")
                 continue
-            if item['encoder_input'].numel() == 0: # Checks if tensor has zero elements
+            if item['encoder_input'].numel() == 0:
                 logger.debug(f"SFTDataset.collate_fn: Item {i} has empty 'encoder_input' tensor. Skipping item.")
                 continue
-            # Optional: Check for empty decoder_target if it's strictly invalid for the model
-            # For SFT, an empty decoder_target (e.g., if only <SQL> was present) might be valid if the model predicts EOS.
-            # If item['decoder_target'].numel() == 0 and not model_can_handle_empty_target:
-            #    logger.debug(f"SFTDataset.collate_fn: Item {i} has empty 'decoder_target'. Skipping.")
-            #    continue
             processed_batch.append(item)
-        
+
         batch = processed_batch
         if not batch:
-            if original_batch_len > 0: 
-                 logger.warning("SFTDataset.collate_fn: Batch is empty after collator's internal filtering (e.g. empty tensors). Skipping batch.")
+            if original_batch_len > 0:
+                logger.warning("SFTDataset.collate_fn: Batch is empty after collator's internal filtering (e.g. empty tensors). Skipping batch.")
             return None
 
-        # Proceed with padding and batching valid items
-        # Max length for encoder_input parts
+        # --- Padding logic ---
         max_enc_len = max(item['encoder_input'].size(0) for item in batch)
-        # Max length for decoder_target parts. Handle case where all decoder_targets might be empty.
-        max_dec_len = 0
-        if any(item['decoder_target'].numel() > 0 for item in batch):
-            max_dec_len = max(item['decoder_target'].size(0) for item in batch if item['decoder_target'].numel() > 0)
-
+        # Always ensure at least length 1 for decoder target (prevents shape errors)
+        max_dec_len = max([item['decoder_target'].size(0) if item['decoder_target'].numel() > 0 else 1 for item in batch])
 
         current_batch_size = len(batch)
-        
-        # Initialize tensors with the provided pad_id
+
         encoder_input_batch = torch.full((current_batch_size, max_enc_len), pad_id, dtype=torch.long)
-        # Attention mask should be boolean, False for padded tokens.
-        encoder_attention_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool) 
+        encoder_attention_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool)
         decoder_target_batch = torch.full((current_batch_size, max_dec_len), pad_id, dtype=torch.long)
-        
-        # Relation matrix is (B, max_enc_len, max_enc_len)
         relation_matrix_batch = torch.zeros(current_batch_size, max_enc_len, max_enc_len, dtype=torch.long)
-        # Schema mask is (B, max_enc_len)
         schema_mask_batch = torch.zeros(current_batch_size, max_enc_len, dtype=torch.bool)
-        
+
         for i, item in enumerate(batch):
             enc_len = item['encoder_input'].size(0)
             encoder_input_batch[i, :enc_len] = item['encoder_input']
-            # item['encoder_attention_mask'] is already True for non-padded, so directly assign.
             encoder_attention_mask_batch[i, :enc_len] = item['encoder_attention_mask'] 
-            
-            # Relation matrix and schema mask checks (shape based on enc_len)
+
             if 'relation_matrix' in item and item['relation_matrix'].ndim == 2 and \
                item['relation_matrix'].shape[0] == enc_len and item['relation_matrix'].shape[1] == enc_len:
                 relation_matrix_batch[i, :enc_len, :enc_len] = item['relation_matrix']
-            # else: (Optional: log if shape mismatch and non-default tensor was provided, or if key missing)
 
             if 'schema_mask' in item and item['schema_mask'].ndim == 1 and item['schema_mask'].shape[0] == enc_len:
-                 schema_mask_batch[i, :enc_len] = item['schema_mask']
-            # else: (Optional: log if shape mismatch or key missing)
+                schema_mask_batch[i, :enc_len] = item['schema_mask']
 
             dec_len = item['decoder_target'].size(0)
-            if dec_len > 0: # Only copy if decoder_target is not empty
+            # If decoder_target is empty, leave row as all PADs
+            if dec_len > 0:
                 decoder_target_batch[i, :dec_len] = item['decoder_target']
-        
+
         return {
             'encoder_input': encoder_input_batch,
             'decoder_target': decoder_target_batch,
