@@ -4,22 +4,22 @@ Refactored Relation Matrix Builder
 =================================
 This version focuses on *clarity* and *robustness*:
 
-* **Single‑responsibility helpers** – each small method does one thing.
-* **Early schema extraction** – the full input is sliced to the
-  `<SCHEMA> … </SCHEMA>` span before any parsing. Internal logic never
+* **Single‑responsibility helpers** – each small method does one thing.
+* **Early schema extraction** – the full input is sliced to the
+  `<SCHEMA> … </SCHEMA>` span before any parsing. Internal logic never
   sees NL / COT / SQL tokens again.
-* **Token‑driven parsing** – we walk the token list once, recognising
+* **Token‑driven parsing** – we walk the token list once, recognising
   tables & columns by the presence of `(` and special PK/FK wrappers.
-* **Leaner dependency surface** – no regex over token streams, no
+* **Leaner dependency surface** – no regex over token streams, no
   multi‑stage caches; decoding is minimal & memoised.
-* **Guaranteed relation count** – `_REL_MAP` is a single source of truth;
-  constructor asserts `num_relations ≥ len(_REL_MAP)`.
+* **Guaranteed relation count** – `_REL_MAP` is a single source of truth;
+  constructor asserts `num_relations ≥ len(_REL_MAP)`.
 
 compatible with the previous class: `build_relation_matrix`
-returns a `torch.LongTensor (seq_len × seq_len)` with the same relation IDs.
+returns a `torch.LongTensor (seq_len × seq_len)` with the same relation IDs.
 
->>> rmb = RelationMatrixBuilder(tokenizer)
->>> rel = rmb.build_relation_matrix(full_ids)  # works like before
+>>> rmb = RelationMatrixBuilder(tokenizer)
+>>> rel = rmb.build_relation_matrix(full_ids)  # works like before
 
 If we hit an assertion or error, enable DEBUG logging – the walker prints a
 step‑by‑step trace of its decisions.
@@ -33,6 +33,16 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+DEBUG_VERBOSE = False  # Set True to enable detailed relation matrix build logging
+
+def debug_log(msg, logger=None, *args):
+    """Helper function for debug logging that respects DEBUG_VERBOSE flag"""
+    if DEBUG_VERBOSE:
+        if logger:
+            logger.debug(msg, *args)
+        else:
+            print(msg)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # flip to DEBUG while debugging
@@ -60,13 +70,13 @@ class SchemaToken:
         return self.token_type, self.table_name or "", self.column_name or ""
 
     # nice for debugging in logs
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:  # pragma: no cover
         ref = (
             f" → {self.references[0]}.{self.references[1]}" if self.references else ""
         )
         return (
             f"<{self.token_type}:{self.table_name or ''}.{self.column_name or ''}{ref}"  # noqa:E501
-            f" [{self.span_start}:{self.span_end}]>"
+            f" [{self.span_start}:{self.span_end}]>"
         )
 
 
@@ -90,7 +100,7 @@ class RelationMatrixBuilder:
     # ---------------------------------------------------------------------
     def __init__(self, tokenizer, num_relations: int = 5):
         self.sp = tokenizer.sp  # sentencepiece model (must expose .encode/.decode)
-        self.tok_id = tokenizer.special_token_ids  # name → id
+        self.tok_id = tokenizer.special_token_ids  # name → id
 
         # sanity – make sure we have our required specials
         required = {
@@ -119,7 +129,7 @@ class RelationMatrixBuilder:
         if tid not in self._decode_cache:
             try:
                 self._decode_cache[tid] = self.sp.decode([tid])
-            except Exception:  # pragma: no cover
+            except Exception:  # pragma: no cover
                 self._decode_cache[tid] = ""
         return self._decode_cache[tid]
 
@@ -132,7 +142,7 @@ class RelationMatrixBuilder:
         return bool(re.match(r"^[a-z_][a-z0-9_]*$", name))
 
     # ------------------------------------------------------------------
-    # Phase 1 – slice out the schema       full_ids  →  schema_ids
+    # Phase 1 – slice out the schema       full_ids  →  schema_ids
     # ------------------------------------------------------------------
     def _extract_schema_segment(self, full_ids: List[int]) -> List[int]:
         """Return the sub‑list *between* <SCHEMA> and </SCHEMA>."""
@@ -148,7 +158,7 @@ class RelationMatrixBuilder:
         return full_ids[s:e]
 
     # ------------------------------------------------------------------
-    # Phase 2 – walk schema tokens and materialise SchemaToken objects
+    # Phase 2 – walk schema tokens and materialise SchemaToken objects
     # ------------------------------------------------------------------
     def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
         schema_ids = self._extract_schema_segment(full_ids)
@@ -270,11 +280,11 @@ class RelationMatrixBuilder:
             # Anything else – advance one token
             pos += 1
 
-        logger.debug("Parsed schema tokens: %s", tokens)
+        debug_log("Parsed schema tokens: %s", logger, tokens)
         return tokens
 
     # ------------------------------------------------------------------
-    # Phase 3 – build relation matrix
+    # Phase 3 – build relation matrix
     # ------------------------------------------------------------------
     def build_relation_matrix(
         self,
@@ -291,11 +301,11 @@ class RelationMatrixBuilder:
 
         for i in schema_tokens:
             for j in schema_tokens:
-                # same table ------------------------------------------------
+                # same table ------------------------------------------------
                 if i.table_name and i.table_name == j.table_name:
                     set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["same_table"])
 
-                # pk ↔ fk ---------------------------------------------------
+                # pk ↔ fk ---------------------------------------------------
                 if i.token_type == "pk" and j.token_type == "fk" and j.references == (
                     i.table_name,
                     i.column_name,
@@ -307,13 +317,13 @@ class RelationMatrixBuilder:
                 ):
                     set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["pk_fk"])
 
-                # table ↔ column -------------------------------------------
+                # table ↔ column -------------------------------------------
                 if i.token_type == "table" and j.token_type in {"column", "pk", "fk"} and i.table_name == j.table_name:
                     set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["table_column"])
                 if j.token_type == "table" and i.token_type in {"column", "pk", "fk"} and j.table_name == i.table_name:
                     set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["table_column"])
 
-                # same column name across tables ---------------------------
+                # same column name across tables ---------------------------
                 if (
                     i.token_type in {"column", "pk", "fk"}
                     and j.token_type in {"column", "pk", "fk"}
@@ -324,5 +334,5 @@ class RelationMatrixBuilder:
                     set_span((i.span_start, i.span_end), (j.span_start, j.span_end), self._REL_MAP["same_column"])
 
         nz = (rel > 0).sum().item()
-        logger.info("Relation matrix built – %d non‑zero cells", nz)
+        debug_log("Relation matrix built – %d non‑zero cells", logger, nz)
         return rel

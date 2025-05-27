@@ -10,6 +10,14 @@ from relation_matrix import RelationMatrixBuilder
 
 logger = logging.getLogger(__name__)
 
+def debug_log(msg, logger=None):
+    """Helper function for debug logging that respects DEBUG_VERBOSE flag"""
+    if DEBUG_VERBOSE:
+        if logger:
+            logger.debug(msg)
+        else:
+            print(msg)
+
 class SFTDataset(Dataset):
     """Dataset for supervised fine-tuning of NL2SQL model.
     Assumes data_file is a .txt file where each line contains space-separated
@@ -142,7 +150,7 @@ class SFTDataset(Dataset):
 
         line_str = line_str.strip()
         if not line_str:
-            logger.debug(f"SFTDataset [EX {idx}]: Line is empty or whitespace after read. Dropping.")
+            debug_log(f"SFTDataset [EX {idx}]: Line is empty or whitespace after read. Dropping.", logger)
             self.dropped_count += 1
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
@@ -150,7 +158,7 @@ class SFTDataset(Dataset):
         try:
             original_token_ids = [int(token_id_str) for token_id_str in line_str.split()]
             if not original_token_ids:
-                logger.debug(f"SFTDataset [EX {idx}]: Line resulted in empty token list after split. Dropping.")
+                debug_log(f"SFTDataset [EX {idx}]: Line resulted in empty token list after split. Dropping.", logger)
                 self.dropped_count += 1
                 self._log_counts_summary_if_needed(dataset_name="SFTDataset")
                 return None
@@ -173,7 +181,7 @@ class SFTDataset(Dataset):
 
         # 2. Rule: Empty / All tokens equal to pad_id
         if not token_ids:
-            logger.debug(f"SFTDataset [EX {idx}]: Sequence empty after trimming pad_id ({self.pad_token_id}). Dropping.")
+            debug_log(f"SFTDataset [EX {idx}]: Sequence empty after trimming pad_id ({self.pad_token_id}). Dropping.", logger)
             self.dropped_count += 1
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
@@ -182,14 +190,14 @@ class SFTDataset(Dataset):
         if self.vocab_size != float('inf'): # Only if vocab_size is known
             for i, token_id in enumerate(token_ids):
                 if not (0 <= token_id < self.vocab_size):
-                    logger.debug(f"SFTDataset [EX {idx}]: OOV token ID {token_id} at pos {i} (vocab size {self.vocab_size}). Dropping. Sample: {token_ids[:10]}...")
+                    debug_log(f"SFTDataset [EX {idx}]: OOV token ID {token_id} at pos {i} (vocab size {self.vocab_size}). Dropping. Sample: {token_ids[:10]}...", logger)
                     self.dropped_count += 1
                     self._log_counts_summary_if_needed(dataset_name="SFTDataset")
                     return None
         
         # 4. Rule: Too short (SFT: len < 4)
         if len(token_ids) < self.min_len:
-            logger.debug(f"SFTDataset [EX {idx}]: Sequence too short (len {len(token_ids)} < min_len {self.min_len}) after trimming. Dropping. Sample: {token_ids}")
+            debug_log(f"SFTDataset [EX {idx}]: Sequence too short (len {len(token_ids)} < min_len {self.min_len}) after trimming. Dropping. Sample: {token_ids}", logger)
             self.dropped_count += 1
             self._log_counts_summary_if_needed(dataset_name="SFTDataset")
             return None
@@ -342,12 +350,12 @@ class SFTDataset(Dataset):
         # Verify first sample globally (for debugging)
         if DEBUG_VERBOSE and not SFTDataset._first_sample_globally_logged:
             try:
-                logger.debug("\nFirst sample verification (SFTDataset - lazy loaded):")
-                logger.debug(f"Original line (idx {idx}): '{line_str[:100]}...'")
-                logger.debug(f"Encoder input tokens (before COT) (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}")
-                logger.debug(f"Decoder target tokens (COT through SQL_END) (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}")
+                debug_log("\nFirst sample verification (SFTDataset - lazy loaded):", logger)
+                debug_log(f"Original line (idx {idx}): '{line_str[:100]}...'", logger)
+                debug_log(f"Encoder input tokens (before COT) (len={len(final_encoder_input_tokens)}): {self.tokenizer.decode(final_encoder_input_tokens)}", logger)
+                debug_log(f"Decoder target tokens (COT through SQL_END) (len={len(raw_target_tokens)}): {self.tokenizer.decode(raw_target_tokens)}", logger)
                 if self.config.use_pointer_generator:
-                    logger.debug(f"Schema mask for PG (sum of True): {schema_mask_for_pg.sum().item()}")
+                    debug_log(f"Schema mask for PG (sum of True): {schema_mask_for_pg.sum().item()}", logger)
                 SFTDataset._first_sample_globally_logged = True
             except Exception as e:
                 logger.error(f"Error logging first sample: {e}")

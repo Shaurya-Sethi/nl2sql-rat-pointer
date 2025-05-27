@@ -19,6 +19,16 @@ import random
 import contextlib # Added for nullcontext
 from .bnb_utils import ensure_bnb_state, cleanup_bnb_step_tensors # Import the new utility
 
+DEBUG_VERBOSE = False  # Set True to enable detailed training debug logs
+
+def debug_log(msg, logger=None):
+    """Helper function for debug logging that respects DEBUG_VERBOSE flag"""
+    if DEBUG_VERBOSE:
+        if logger:
+            logger.debug(msg)
+        else:
+            print(msg)
+
 logger = logging.getLogger(__name__)
 
 
@@ -284,7 +294,7 @@ class Trainer:
         
         for batch_idx, batch in enumerate(progress_bar):
             if batch_idx == 0 and self.config.use_8bit_optimizer:
-                logger.info(f"Epoch {self.epoch}: Ensuring BnB optimizer state at the start of the epoch (batch_idx 0)...")
+                debug_log(f"Epoch {self.epoch}: Ensuring BnB optimizer state at the start of the epoch (batch_idx 0)...", logger)
                 ensure_bnb_state(self.optimizer, device=self.device)
 
             if batch is None:
@@ -306,7 +316,7 @@ class Trainer:
                     for k in batch:
                         if isinstance(batch[k], torch.Tensor):
                             batch[k] = batch[k][:current_batch_size]
-                    logger.info(f"Trimmed batch to {current_batch_size} samples")
+                    debug_log(f"Trimmed batch to {current_batch_size} samples", logger)
                 
                 # Move batch to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -554,7 +564,7 @@ class Trainer:
                 if current_batch_size < original_batch_size and batch_idx % 10 == 0:
                     new_batch_size = min(current_batch_size + 1, original_batch_size)
                     if new_batch_size > current_batch_size:
-                        logger.info(f"Training stable, attempting to increase batch size to {new_batch_size}")
+                        debug_log(f"Training stable, attempting to increase batch size to {new_batch_size}", logger)
                         current_batch_size = new_batch_size
                 
             except RuntimeError as e:
@@ -678,6 +688,11 @@ class Trainer:
             # Save a checkpoint of the writer to flush logs
             if self.writer:
                 self.writer.flush()
+        
+        # Clear CUDA cache to reduce memory fragmentation (if GPU is used)
+        if torch.cuda.is_available():
+            debug_log("Clearing CUDA cache to potentially reduce memory fragmentation.", logger)
+            torch.cuda.empty_cache()
         
         return {'train_loss': avg_loss}
         
