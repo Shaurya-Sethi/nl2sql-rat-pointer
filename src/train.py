@@ -240,6 +240,7 @@ def main():
         train_dataloader=train_loader,
         val_dataloader=eval_loader,
         device=device,
+        tokenizer=tokenizer,  # Pass tokenizer for periodic generation
     )
     global_trainer = trainer  # Set the global trainer for signal handlers
 

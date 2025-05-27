@@ -46,6 +46,10 @@ def _sanitize_hparams(hparams):
 
 
 class Trainer:
+    GENERATE_EVERY_N = 1000  # How often to print model generations
+    GENERATE_ENABLED = True  # Toggle for periodic generation
+    GENERATE_MAX_TOKENS = 512  # Max tokens to decode for output
+
     def __init__(
         self,
         model: nn.Module,
@@ -58,7 +62,8 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         early_stopping_patience: int = 3,
-        mixed_precision: bool = True
+        mixed_precision: bool = True,
+        tokenizer=None  # <-- Add tokenizer argument
     ):
         """
         Initialize trainer.
@@ -75,6 +80,7 @@ class Trainer:
             max_grad_norm: Maximum gradient norm for clipping
             early_stopping_patience: Number of epochs to wait before early stopping
             mixed_precision: Whether to use mixed precision training
+            tokenizer: Tokenizer for decoding model generations
         """
         self.model = model
         self.config = config
@@ -257,6 +263,8 @@ class Trainer:
         else:
             self.writer = None
             logger.info("TensorBoard logging disabled")
+        
+        self.tokenizer = tokenizer  # Store tokenizer for decoding
         
     def train_epoch(self) -> Dict[str, float]:
         """
@@ -446,6 +454,66 @@ class Trainer:
                         elif self.writer:
                             current_lr = self.optimizer.param_groups[0]['lr']
                             self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
+
+                        # === Karpathy-style periodic model generation ===
+                        if (
+                            getattr(self, 'GENERATE_ENABLED', True)
+                            and self.global_step % getattr(self, 'GENERATE_EVERY_N', 1000) == 0
+                            and hasattr(self, 'tokenizer') and self.tokenizer is not None
+                        ):
+                            try:
+                                import re
+                                # Take the first sample from the batch
+                                enc_in = batch['encoder_input'][0:1]  # (1, seq_len)
+                                rel_mat = batch['relation_matrix'][0:1]
+                                attn_mask = batch['encoder_attention_mask'][0:1]
+                                schema_mask = batch.get('schema_mask')
+                                if schema_mask is not None:
+                                    schema_mask = schema_mask[0:1]
+                                # Prepare kwargs for model.generate
+                                gen_kwargs = dict(
+                                    encoder_input_ids=enc_in,
+                                    encoder_relation_ids=rel_mat,
+                                    encoder_attention_mask=attn_mask,
+                                    max_length=getattr(self, 'GENERATE_MAX_TOKENS', 512),
+                                )
+                                if self.config.use_pointer_generator:
+                                    gen_kwargs['schema_mask'] = schema_mask
+                                # Run generation
+                                with torch.no_grad():
+                                    generated = self.model.generate(**gen_kwargs)
+                                # Decode input prompt (remove schema/ext)
+                                prompt_ids = enc_in[0].tolist()
+                                prompt_decoded = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                                # Remove <SCHEMA>...</SCHEMA> and <EXT>...</EXT> blocks
+                                prompt_decoded = re.sub(r"<SCHEMA>.*?</SCHEMA>", "", prompt_decoded, flags=re.DOTALL)
+                                prompt_decoded = re.sub(r"<EXT>.*?</EXT>", "", prompt_decoded, flags=re.DOTALL)
+                                prompt_decoded = prompt_decoded.strip()
+                                # Decode generated output (limit to max tokens)
+                                gen_ids = generated[0].tolist()[:getattr(self, 'GENERATE_MAX_TOKENS', 512)]
+                                gen_decoded = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                                # Extract CoT and SQL
+                                def extract_cot_and_sql(decoded_str):
+                                    cot = sql = "(not found)"
+                                    cot_match = re.search(r"<COT>(.*?)</COT>", decoded_str, re.DOTALL)
+                                    if cot_match:
+                                        cot = cot_match.group(1).strip()
+                                    sql_match = re.search(r"<SQL>(.*?)</SQL>", decoded_str, re.DOTALL)
+                                    if sql_match:
+                                        sql = sql_match.group(1).strip()
+                                    return cot, sql
+                                cot, sql = extract_cot_and_sql(gen_decoded)
+                                print("\n===============================")
+                                print(f"[Step {self.global_step}] Model Sample")
+                                print(f"Prompt: {prompt_decoded}")
+                                print("--- Chain of Thought ---")
+                                print(cot)
+                                print("--- SQL Output ---")
+                                print(sql)
+                                print("===============================\n")
+                            except Exception as e:
+                                print(f"[Karpathy-Gen] Error during periodic generation: {e}")
+                        # === End periodic model generation ===
 
                     except (KeyError, TypeError) as e:
                         error_str = str(e).lower() # For easier checking
