@@ -41,22 +41,23 @@ SPECIAL_TOKENS = {
 
 # ────────────────────────────────────────────────────────────────────────────
 def _format_table(table: Dict, fk_map: Dict[str, set]) -> str:
-    """Return single-table string with grouped <PK> wrapper if needed."""
+    """Return single-table string with each PK in its own <PK> wrapper."""
     tname = table["name"]
     pk_cols = [c for c in table["columns"] if c.get("pk")]
     fk_cols = fk_map.get(tname, set())
 
     col_chunks: List[str] = []
 
-    # -- 1. Composite-PK wrapper (even for single-PK) -----------------------
-    if pk_cols:
-        pk_inner = ", ".join(f"{c['name']}:{c['type']}" for c in pk_cols)
-        col_chunks.append(f"{SPECIAL_TOKENS['PK_START']} {pk_inner} {SPECIAL_TOKENS['PK_END']}")
+    # -- 1. Each PK column in its own wrapper --------------------------
+    for c in pk_cols:
+        col_chunks.append(
+            f"{SPECIAL_TOKENS['PK_START']} {c['name']}:{c['type']} {SPECIAL_TOKENS['PK_END']}"
+        )
 
-    # -- 2. Non-PK columns ---------------------------------------------------
+    # -- 2. Non-PK columns --------------------------------------------
     for col in table["columns"]:
         if col.get("pk"):
-            continue  # already handled in the grouped wrapper
+            continue  # already handled above
 
         cname, ctype = col["name"], col["type"]
         if cname in fk_cols:
@@ -64,7 +65,7 @@ def _format_table(table: Dict, fk_map: Dict[str, set]) -> str:
         else:
             col_chunks.append(f"{cname}:{ctype}")
 
-    return f"{tname}({','.join(col_chunks)})"
+    return f"{tname}({', '.join(col_chunks)})"
 
 
 def format_schema(schema: Dict) -> str:
