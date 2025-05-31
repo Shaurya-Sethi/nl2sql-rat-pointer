@@ -65,7 +65,7 @@ sft:
   # ---------- data ----------------------------------- #
   train_file:  "src/datasets/paired_nl_sql/splits/tokenized_sft_filtered_train.txt"
   eval_file:   "src/datasets/paired_nl_sql/splits/tokenized_sft_filtered_val.txt"
-  epochs:      4
+  epochs:      2
 
   # ---------- batch / accumulation ------------------- #
   micro_batch_size:      1        # fits 1664-token context
@@ -75,7 +75,7 @@ sft:
   # ---------- optimisation --------------------------- #
   learning_rate:   3.0e-5
   scheduler:       cosine
-  warmup_steps:    3000
+  warmup_steps:    100
   max_steps:       206250
   weight_decay:    0.01
   max_grad_norm:   1.0
