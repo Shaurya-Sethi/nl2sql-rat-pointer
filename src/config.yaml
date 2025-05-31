@@ -57,7 +57,7 @@ pretrain:
   bf16:                   true     # L4 supports bf16; gives more headroom
   use_8bit_optimizer:     true
   gradient_checkpointing: true
-  save_steps:             1        # Save a checkpoint after every epoch
+  save_steps:             2000        # Save a checkpoint after 2000 steps
   num_workers:            4
   early_stopping_patience: null
 
@@ -89,7 +89,7 @@ sft:
   bf16:                   true     # enable bf16 for extra VRAM savings
   use_8bit_optimizer:     true
   gradient_checkpointing: true
-  save_steps:             1
+  save_steps:             20000
   num_workers:            4
   early_stopping_patience: 3
 
