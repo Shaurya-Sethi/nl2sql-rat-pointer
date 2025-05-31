@@ -1,0 +1,24 @@
+2025-05-31 07:51:11,705 - INFO - __main__ - No checkpoint found to resume from, and not SFT with --pretrained_model. Starting sft training from scratch.
+2025-05-31 07:51:11,705 - INFO - __main__ - Starting sft training for 206250 steps...
+2025-05-31 07:51:11,705 - INFO - __main__ - Calculated num_epochs based on max_steps: 4
+2025-05-31 07:51:11,705 - INFO - __main__ - Target total epochs for this run: 4
+2025-05-31 07:51:11,705 - INFO - __main__ - Found latest_checkpoint.pt. Attempting to resume from: outputs/latest_checkpoint.pt
+2025-05-31 07:51:11,705 - INFO - utils.training - Loading checkpoint from outputs/latest_checkpoint.pt
+2025-05-31 07:51:23,089 - INFO - utils.training - Loaded checkpoint from outputs/latest_checkpoint.pt
+2025-05-31 07:51:23,089 - INFO - utils.training - Resuming from Epoch: 1, Global Step: 54298, Best Val Loss: 0.0018, Learning Rate: 3e-05
+2025-05-31 07:51:23,089 - INFO - utils.training - Ensuring bitsandbytes optimizer state is robustly initialized after loading checkpoint...
+2025-05-31 07:51:23,089 - INFO - utils.training - Cleaning up any tensor 'step' entries in bitsandbytes optimizer state...
+2025-05-31 07:51:23,089 - INFO - utils.training - Attempting to restore RNG states from checkpoint for reproducibility...
+2025-05-31 07:51:23,097 - ERROR - utils.training -   - Failed to restore PyTorch CPU RNG state: RNG state must be a torch.ByteTensor
+2025-05-31 07:51:23,097 - INFO - utils.training -   - Successfully restored NumPy RNG state.
+2025-05-31 07:51:23,097 - INFO - utils.training -   - Successfully restored Python random module RNG state.
+2025-05-31 07:51:23,101 - ERROR - utils.training -   - Failed to restore PyTorch CUDA RNG state: RNG state must be a torch.ByteTensor
+2025-05-31 07:51:23,102 - WARNING - utils.training - One or more RNG states were missing or failed to restore from the checkpoint. Full reproducibility might be affected if this checkpoint is from an older version or a different environment.
+2025-05-31 07:51:23,102 - INFO - utils.training - Ensuring TensorBoard writer is closed.
+2025-05-31 07:51:23,102 - INFO - utils.training - Closing TensorBoard writer
+2025-05-31 07:51:23,103 - INFO - __main__ - Successfully resumed training state using checkpoint: outputs/latest_checkpoint.pt
+2025-05-31 07:51:23,104 - INFO - __main__ - Learning Rate Check - Config: 3e-05, Current: 3e-05
+2025-05-31 07:51:23,104 - INFO - __main__ - Starting sft training. Will train for a total of 4 epochs.
+2025-05-31 07:51:23,104 - INFO - __main__ - Initial state: Epoch 1, Global Step 54298, Best Val Loss 0.0018
+2025-05-31 07:51:23,104 - INFO - __main__ - Max steps for LR scheduler remains: 206250
+2025-05-31 07:51:23,104 - INFO - __main__ - Starting Epoch 2/4 (Global Step: 54298) | Max steps for LR scheduler: 206250
