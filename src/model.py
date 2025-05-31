@@ -264,7 +264,7 @@ class NL2SQLTransformer(nn.Module):
 
         # Initialize decoder input with COT_START token ID
         if self.cot_start_token_id is None:
-            start_token_id = self.pad_token_id + 1
+            raise ValueError("cot_start_token_id must be provided for generation.")
         else:
             start_token_id = self.cot_start_token_id
         decoder_input = torch.full((batch_size, 1), start_token_id,
@@ -281,7 +281,12 @@ class NL2SQLTransformer(nn.Module):
             tgt_key_padding = (decoder_input == self.pad_token_id)
 
             if self.use_pointer_generator:
-                src_mask = schema_mask if schema_mask is not None else torch.zeros_like(encoder_input_ids, dtype=torch.bool, device=device)
+                if schema_mask is None:
+                    print("Warning: schema_mask is None during generation with pointer-generator. Pointer may not target schema tokens correctly.")
+                    # Default to a non-schema mask if None, but this might be suboptimal
+                    src_mask = torch.zeros_like(encoder_input_ids, dtype=torch.bool, device=device)
+                else:
+                    src_mask = schema_mask
                 out = self.decoder(
                     tgt_ids=decoder_input,
                     src_ids=encoder_input_ids,

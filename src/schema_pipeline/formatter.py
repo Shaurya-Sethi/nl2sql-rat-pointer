@@ -1,13 +1,5 @@
 """
-formatter.py – Schema → single-line text for NL2SQL (composite PK grouping)
-
-Key change
-----------
-• For any table with ≥1 PK columns, they are emitted **once** inside a single
-  <PK> … </PK> wrapper, comma-separated:
-      table1(<PK> a:int, b:int </PK>, col3:text, …)
-
-All other behaviour (FK wrapper, order, SPECIAL_TOKENS) is unchanged.
+formatter.py – Schema → single-line text for NL2SQL
 """
 
 from __future__ import annotations

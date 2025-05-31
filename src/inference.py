@@ -103,6 +103,56 @@ class NL2SQLInference:
         else:
             self.model.load_state_dict(state, strict=False)
 
+    def _prepare_model_inputs(self, question: str, schema_tokens: Union[List[int], torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Helper method to prepare model inputs for both infer and infer_stream.
+        """
+        # 1. Tokenize NL question with <NL> ... </NL> wrappers
+        nl_start = self.tokenizer.get_special_token_id("NL_START")
+        nl_end = self.tokenizer.get_special_token_id("NL_END")
+        nl_ids = [nl_start] + self.tokenizer.encode(question, add_special_tokens=False) + [nl_end]
+
+        # 2. Concatenate NL and schema tokens
+        if isinstance(schema_tokens, torch.Tensor):
+            schema_ids = schema_tokens.tolist()
+        else:
+            schema_ids = list(schema_tokens)
+        encoder_input_ids_list = nl_ids + schema_ids
+        input_len = len(encoder_input_ids_list)
+
+        if input_len > self.config.max_len:
+            raise ValueError(
+                f"Combined token length of NL ({len(nl_ids)}) and schema ({len(schema_ids)}) tokens is {input_len}, "
+                f"which exceeds the model's configured max_len ({self.config.max_len}). "
+                f"Please shorten the question or provide a smaller schema segment."
+            )
+
+        # 3. Prepare model inputs (tensors)
+        encoder_input_ids = torch.tensor(encoder_input_ids_list, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, L)
+        encoder_attention_mask = (encoder_input_ids != self.config.pad_token_id) # True for non-pad
+        
+        relation_matrix = torch.zeros((1, input_len, input_len), dtype=torch.long, device=self.device)
+        if self.relation_builder is not None:
+            relation_matrix = self.relation_builder.build_relation_matrix(encoder_input_ids_list).unsqueeze(0)
+
+        schema_mask = None
+        if self.config.use_pointer_generator:
+            schema_mask = torch.zeros((1, input_len), dtype=torch.bool, device=self.device)
+            try:
+                schema_start_idx = encoder_input_ids_list.index(self.tokenizer.get_special_token_id("SCHEMA_START"))
+                schema_end_idx = encoder_input_ids_list.index(self.tokenizer.get_special_token_id("SCHEMA_END"))
+                if schema_end_idx > schema_start_idx:
+                    schema_mask[0, schema_start_idx:schema_end_idx+1] = True
+            except ValueError:
+                pass # If schema tags not found, leave mask as all False
+
+        return {
+            "encoder_input_ids": encoder_input_ids,
+            "encoder_attention_mask": encoder_attention_mask,
+            "relation_matrix": relation_matrix,
+            "schema_mask": schema_mask
+        }
+
     def infer(
         self,
         question: str,
@@ -118,54 +168,12 @@ class NL2SQLInference:
         Returns:
             Dict with keys "sql" and optionally "cot".
         """
-        # 1. Tokenize NL question with <NL> ... </NL> wrappers
-        nl_start = self.tokenizer.get_special_token_id("NL_START")
-        nl_end = self.tokenizer.get_special_token_id("NL_END")
-        nl_ids = [nl_start] + self.tokenizer.encode(question, add_special_tokens=False) + [nl_end]
-
-        # 2. Concatenate NL and schema tokens
-        if isinstance(schema_tokens, torch.Tensor):
-            schema_ids = schema_tokens.tolist()
-        else:
-            schema_ids = list(schema_tokens)
-        encoder_input_ids = nl_ids + schema_ids
-        input_len = len(encoder_input_ids)
-
-        if input_len > self.config.max_len:
-            # Consider how to handle this. For now, raise an error.
-            # Truncation strategies could be implemented but are complex.
-            raise ValueError(
-                f"Combined token length of NL ({len(nl_ids)}) and schema ({len(schema_ids)}) tokens is {input_len}, "
-                f"which exceeds the model's configured max_len ({self.config.max_len}). "
-                f"Please shorten the question or provide a smaller schema segment."
-            )
-
-        # 3. Prepare model inputs
-        input_len = len(encoder_input_ids)
-        encoder_input = torch.tensor(encoder_input_ids, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, L)
-        # Attention mask: True for non-pad tokens
-        encoder_attention_mask = (encoder_input != self.config.pad_token_id)
-        # Relation matrix: (1, L, L)
-        relation_builder = self.relation_builder
-        if relation_builder is not None:
-            relation_matrix = relation_builder.build_relation_matrix(encoder_input_ids).unsqueeze(0)
-        else:
-            relation_matrix = torch.zeros((1, input_len, input_len), dtype=torch.long, device=self.device)
-
-        # Schema mask for pointer-generator
-        schema_mask = None
-        if self.config.use_pointer_generator:
-            # Build schema mask: True for schema tokens (as in SFT)
-            schema_mask = torch.zeros((1, input_len), dtype=torch.bool, device=self.device)
-            # Use the same logic as SFTDataset: mark all tokens between <SCHEMA> and </SCHEMA>
-            try:
-                schema_start = encoder_input_ids.index(self.tokenizer.get_special_token_id("SCHEMA_START"))
-                schema_end = encoder_input_ids.index(self.tokenizer.get_special_token_id("SCHEMA_END"))
-                if schema_end > schema_start:
-                    schema_mask[0, schema_start:schema_end+1] = True
-            except ValueError:
-                # If schema tags not found, leave mask as all False
-                pass
+        # 1. Prepare model inputs using helper
+        inputs = self._prepare_model_inputs(question, schema_tokens)
+        encoder_input = inputs["encoder_input_ids"]
+        relation_matrix = inputs["relation_matrix"]
+        encoder_attention_mask = inputs["encoder_attention_mask"]
+        schema_mask = inputs["schema_mask"]
 
         # 4. Generate output tokens
         with torch.no_grad():
@@ -232,40 +240,12 @@ class NL2SQLInference:
         Token-by-token streaming inference.
         Yields each decoded token string as soon as it is produced.
         """
-        # 1. Build the encoder inputs exactly as in `infer()`
-        nl_start = self.tokenizer.get_special_token_id("NL_START")
-        nl_end   = self.tokenizer.get_special_token_id("NL_END")
-        nl_ids   = [nl_start] + self.tokenizer.encode(question, add_special_tokens=False) + [nl_end]
-
-        schema_ids = schema_tokens.tolist() if isinstance(schema_tokens, torch.Tensor) else list(schema_tokens)
-        encoder_input_ids = nl_ids + schema_ids
-        input_len = len(encoder_input_ids)
-
-        if input_len > self.config.max_len:
-            raise ValueError(
-                f"Combined token length of NL ({len(nl_ids)}) and schema ({len(schema_ids)}) tokens is {input_len}, "
-                f"which exceeds the model's configured max_len ({self.config.max_len}). "
-                f"Please shorten the question or provide a smaller schema segment."
-            )
-
-        encoder_input = torch.tensor(encoder_input_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        encoder_attention_mask = (encoder_input != self.config.pad_token_id)
-        relation_builder = self.relation_builder
-        if relation_builder is not None:
-            relation_matrix = relation_builder.build_relation_matrix(encoder_input_ids).unsqueeze(0)
-        else:
-            relation_matrix = torch.zeros((1, input_len, input_len), dtype=torch.long, device=self.device)
-
-        schema_mask = None
-        if self.config.use_pointer_generator:
-            schema_mask = torch.zeros((1, input_len), dtype=torch.bool, device=self.device)
-            try:
-                schema_start = encoder_input_ids.index(self.tokenizer.get_special_token_id("SCHEMA_START"))
-                schema_end = encoder_input_ids.index(self.tokenizer.get_special_token_id("SCHEMA_END"))
-                if schema_end > schema_start:
-                    schema_mask[0, schema_start:schema_end+1] = True
-            except ValueError:
-                pass
+        # 1. Build the encoder inputs exactly as in `infer()` using helper
+        inputs = self._prepare_model_inputs(question, schema_tokens)
+        encoder_input = inputs["encoder_input_ids"]
+        relation_matrix = inputs["relation_matrix"]
+        encoder_attention_mask = inputs["encoder_attention_mask"]
+        schema_mask = inputs["schema_mask"]
 
         # 2. Call the streaming generate:
         gen_iter = self.model.generate(

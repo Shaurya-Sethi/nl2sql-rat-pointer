@@ -70,7 +70,7 @@ def _normalize_identifier(dbms: str, identifier: str) -> str:
 
 # ═════════ Base extractor ═══════════
 class BaseSchemaExtractor:
-    dbms: str  # “sqlite” / “postgresql” / “mysql” / “mssql” / “oracle”
+    dbms: str  # "sqlite" / "postgresql" / "mysql" / "mssql" / "oracle"
 
     # ---- mandatory API --------------
     def get_tables(self) -> List[str]: ...
@@ -164,36 +164,38 @@ class PostgresSchemaExtractor(BaseSchemaExtractor):
 
     def get_columns(self, table):
         table_norm = _normalize_identifier(self.dbms, table)
-        q = psql.SQL("""
-            SELECT column_name, data_type,
+        q = psql.SQL(\"\"\"
+            SELECT c.column_name, c.data_type,
                    EXISTS (
                      SELECT 1 FROM information_schema.table_constraints tc
                      JOIN information_schema.key_column_usage kcu
-                       ON kcu.constraint_name = tc.constraint_name
+                       ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
                      WHERE tc.table_name = %s
+                       AND tc.table_schema = %s  -- Added schema filter for tc
                        AND tc.constraint_type = 'PRIMARY KEY'
                        AND kcu.column_name = c.column_name
                    ) AS is_pk
             FROM information_schema.columns c
-            WHERE table_name = %s;
-        """)
-        rows = self._safe_exec(q, (table_norm, table_norm))
+            WHERE c.table_name = %s AND c.table_schema = %s; -- Added schema filter for c
+        \"\"\")
+        rows = self._safe_exec(q, (table_norm, self.schema, table_norm, self.schema))
         return [{"name": r[0], "type": r[1], "pk": bool(r[2])} for r in rows]
 
     def get_foreign_keys(self, table):
         table_norm = _normalize_identifier(self.dbms, table)
-        q = psql.SQL("""
+        q = psql.SQL(\"\"\"
             SELECT kcu.table_name, kcu.column_name,
                    ccu.table_name, ccu.column_name
             FROM information_schema.table_constraints AS tc
             JOIN information_schema.key_column_usage AS kcu
-              ON tc.constraint_name = kcu.constraint_name
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
             JOIN information_schema.constraint_column_usage AS ccu
-              ON ccu.constraint_name = tc.constraint_name
+              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
             WHERE tc.constraint_type='FOREIGN KEY'
-              AND tc.table_name=%s;
-        """)
-        rows = self._safe_exec(q, (table_norm,))
+              AND tc.table_name=%s
+              AND tc.table_schema = %s; -- Added schema filter for tc
+        \"\"\")
+        rows = self._safe_exec(q, (table_norm, self.schema))
         return [{"from_table": r[0], "from_column": r[1],
                  "to_table": r[2], "to_column": r[3]} for r in rows]
 

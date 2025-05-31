@@ -256,18 +256,18 @@ def repl(session: Session, run_sql: bool):
         cot_text = ""
         sql_text = ""
         for token in stream:
-            if token == "<COT>":
+            if token == FMT_TOK["COT_START"]:
                 in_cot = True
                 continue
-            if token == "</COT>":
+            if token == FMT_TOK["COT_END"]:
                 in_cot = False
                 continue
-            if token == "<SQL>":
+            if token == FMT_TOK["SQL_START"]:
                 console.print()  
                 console.print("\n[bold cyan]SQL:[/bold cyan]", end=" ")
                 in_sql = True
                 continue
-            if token == "</SQL>":
+            if token == FMT_TOK["SQL_END"]:
                 break
             if in_cot:
                 console.print(token, end="", style="dim")
@@ -302,18 +302,18 @@ def oneshot(session: Session, question: str, execute: bool):
     cot_text = ""
     sql_text = ""
     for token in stream:
-        if token == "<COT_START>":
+        if token == FMT_TOK["COT_START"]:
             in_cot = True
             continue
-        if token == "<COT_END>":
+        if token == FMT_TOK["COT_END"]:
             in_cot = False
             continue
-        if token == "<SQL_START>":
+        if token == FMT_TOK["SQL_START"]:
             console.print()  
             console.print("\n[bold cyan]SQL:[/bold cyan]", end=" ")
             in_sql = True
             continue
-        if token == "</SQL>":
+        if token == FMT_TOK["SQL_END"]:
             break
         if in_cot:
             console.print(token, end="", style="dim")
