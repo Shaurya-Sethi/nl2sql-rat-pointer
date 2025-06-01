@@ -15,8 +15,8 @@ This repository contains code for training a natural language to SQL (NL2SQL) tr
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/nl2sql-model.git
-   cd nl2sql-model
+   git clone https://github.com/Shaurya-Sethi/Transqlate.git
+   cd Transqlate
    ```
 
 2. Install dependencies:
