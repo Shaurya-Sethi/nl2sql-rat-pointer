@@ -5,6 +5,9 @@ universal_schema_extractor.py  (robust v2)
 • Adds error-handling, cursor auto-close, identifier normalisation, and
   safer SQL execution.
 
+# All imports in this file should be absolute, relative to src/ root if needed.
+# Do not use sys.path hacks or relative imports.
+
 Dependencies (install what you need):
     pip install psycopg2-binary mysql-connector-python pyodbc cx_Oracle
 """
@@ -164,7 +167,7 @@ class PostgresSchemaExtractor(BaseSchemaExtractor):
 
     def get_columns(self, table):
         table_norm = _normalize_identifier(self.dbms, table)
-        q = psql.SQL(\"\"\"
+        q = psql.SQL("""
             SELECT c.column_name, c.data_type,
                    EXISTS (
                      SELECT 1 FROM information_schema.table_constraints tc
@@ -177,13 +180,13 @@ class PostgresSchemaExtractor(BaseSchemaExtractor):
                    ) AS is_pk
             FROM information_schema.columns c
             WHERE c.table_name = %s AND c.table_schema = %s; -- Added schema filter for c
-        \"\"\")
+        """)
         rows = self._safe_exec(q, (table_norm, self.schema, table_norm, self.schema))
         return [{"name": r[0], "type": r[1], "pk": bool(r[2])} for r in rows]
 
     def get_foreign_keys(self, table):
         table_norm = _normalize_identifier(self.dbms, table)
-        q = psql.SQL(\"\"\"
+        q = psql.SQL("""
             SELECT kcu.table_name, kcu.column_name,
                    ccu.table_name, ccu.column_name
             FROM information_schema.table_constraints AS tc
@@ -194,7 +197,7 @@ class PostgresSchemaExtractor(BaseSchemaExtractor):
             WHERE tc.constraint_type='FOREIGN KEY'
               AND tc.table_name=%s
               AND tc.table_schema = %s; -- Added schema filter for tc
-        \"\"\")
+        """)
         rows = self._safe_exec(q, (table_norm, self.schema))
         return [{"from_table": r[0], "from_column": r[1],
                  "to_table": r[2], "to_column": r[3]} for r in rows]

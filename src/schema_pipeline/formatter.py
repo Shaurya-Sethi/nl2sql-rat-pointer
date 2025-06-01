@@ -9,9 +9,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-# src/ added for NL2SQLTokenizer import when this script is run standalone
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tokenizer import NL2SQLTokenizer  # noqa: E402  pylint: disable=wrong-import-position
+from tokenizer import NL2SQLTokenizer
 
 SPECIAL_TOKENS = {
     "SCHEMA_START": "<SCHEMA>",

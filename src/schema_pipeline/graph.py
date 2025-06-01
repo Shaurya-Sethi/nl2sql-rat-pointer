@@ -4,6 +4,9 @@ graph.py
 Build a directed NetworkX graph from an extracted database *schema* and
 capture **composite primary keys**.
 
+# All imports in this file should be absolute, relative to src/ root if needed.
+# Do not use sys.path hacks or relative imports.
+
 Node IDs
 --------
 table  →  "table:<table_name>"

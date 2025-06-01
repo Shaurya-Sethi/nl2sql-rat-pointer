@@ -5,6 +5,8 @@ from typing import Dict, Optional
 import yaml
 import torch
 
+DEBUG_LOGS = False  # Set True for debug/training logs, False for clean inference
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -238,14 +240,16 @@ class NL2SQLConfig:
                         "This is required for schema+NL truncation."
                     )
                 else: # For other phases (like pretraining, if PG was used there), it's a warning
-                    logger.warning(
-                        "Using pointer-generator without phase_max_len specified. "
-                        "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
-                    )
+                    if DEBUG_LOGS:
+                        logger.warning(
+                            "Using pointer-generator without phase_max_len specified. "
+                            "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
+                        )        
             else:
-                logger.info(
-                    f"Pointer-generator enabled (phase_max_len={config.phase_max_len_pg}, max_sql_len={config.max_sql_len})"
-                )
+                if DEBUG_LOGS:
+                    logger.info(
+                        f"Pointer-generator enabled (phase_max_len={config.phase_max_len_pg}, max_sql_len={config.max_sql_len})"
+                    )
             
         # Warn about very large batch sizes
         effective_batch = config.batch_size * config.gradient_accumulation_steps
@@ -318,10 +322,10 @@ class NL2SQLConfig:
         assert self.pad_token_id == 18, "pad_token_id must be 18 to match tokenizer"
         
         # Additional validation warnings
-        if self.mixed_precision and self.use_bf16:
+        if self.mixed_precision and self.use_bf16 and DEBUG_LOGS:
             logger.info("Using mixed precision with BF16. Ensure your hardware supports BF16.")
             
-        if self.max_len > 1024 and not self.gradient_checkpointing:
+        if self.max_len > 1024 and not self.gradient_checkpointing and DEBUG_LOGS:
             logger.warning(
                 f"Using large max_len ({self.max_len}) without gradient_checkpointing. "
                 "This may lead to OOM errors with large models."
@@ -329,7 +333,7 @@ class NL2SQLConfig:
             
         # Warn about very large batch sizes
         effective_batch = self.batch_size * self.gradient_accumulation_steps
-        if effective_batch > 128:
+        if effective_batch > 128 and DEBUG_LOGS:
             logger.warning(
                 f"Very large effective batch size: {effective_batch}. "
                 "Consider gradient accumulation instead of large micro-batch size."
@@ -348,14 +352,16 @@ class NL2SQLConfig:
                         "This is required for schema+NL truncation."
                     )
                 else: # For other phases (like pretraining, if PG was used there), it's a warning
-                    logger.warning(
-                        "Using pointer-generator without phase_max_len specified. "
-                        "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
-                    )
+                    if DEBUG_LOGS:
+                        logger.warning(
+                            "Using pointer-generator without phase_max_len specified. "
+                            "For SFT, this will be an error. For other phases, memory efficiency might be suboptimal."
+                        )
             else:
-                logger.info(
-                    f"Pointer-generator enabled (phase_max_len={self.phase_max_len_pg}, max_sql_len={self.max_sql_len})"
-                )
+                if DEBUG_LOGS:
+                    logger.info(
+                        f"Pointer-generator enabled (phase_max_len={self.phase_max_len_pg}, max_sql_len={self.max_sql_len})"
+                    )
             
     def to_yaml(self, path: str):
         """Save configuration to YAML file."""

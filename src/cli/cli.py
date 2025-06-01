@@ -1,7 +1,32 @@
-import argparse
+# -----------------------------------------------------------------------------
+# CLI entry point for Transqlate (NL2SQL)
+#
+# NOTE: TEMPORARY CoT SEGMENTATION:
+# For undertrained models, we do NOT check for <COT> to start CoT collection.
+# Instead, we collect all output up to <SQL> as Chain of Thought.
+# Once the model reliably emits <COT>, update `repl()` and `oneshot()` to use
+# the original double-boundary logic: collect CoT only between <COT> and </COT>.
+#
+# Run from the src/ directory:
+#   cd src
+#   python cli/cli.py ...
+# -----------------------------------------------------------------------------
+
 import sys
-import re
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
+
+import logging
+logging.basicConfig(level=logging.WARNING)  # Suppress all INFO logs globally
+
+try:
+    from sentence_transformers import logging as st_logging
+    st_logging.set_verbosity_warning()  # Only show WARNING and ERROR from sentence_transformers
+except ImportError:
+    pass
+
+import argparse
+import re
 from typing import List, Optional, Tuple, Union
 import traceback
 
@@ -13,11 +38,11 @@ from rich.spinner import Spinner
 from rich.table import Table
 
 # --- Transqlate internals ----------------------------------------------------
-from extractor import get_schema_extractor
-from formatter import format_schema, SPECIAL_TOKENS as FMT_TOK
+from schema_pipeline.extractor import get_schema_extractor
+from schema_pipeline.formatter import format_schema, SPECIAL_TOKENS as FMT_TOK
 from tokenizer import NL2SQLTokenizer
-from orchestrator import SchemaRAGOrchestrator
-from selector import build_table_embeddings
+from schema_pipeline.orchestrator import SchemaRAGOrchestrator
+from schema_pipeline.selector import build_table_embeddings
 from inference import NL2SQLInference
 
 # ───────── Optional fuzzy/embeddings libs ─────────
@@ -34,9 +59,7 @@ console = Console()
 
 def print_exception(exc: Exception):
     console.print(Panel.fit(f"[bold red]Error:[/bold red] {exc}", style="red"))
-    if console.is_verbose:
-        traceback.print_exc()
-
+    traceback.print_exc()
 
 # -----------------------------------------------------------------------------
 # Interactive credential gathering
@@ -66,7 +89,6 @@ def collect_db_params(db_type: str) -> Tuple[str, dict]:
             params["service_name"] = params.pop("database")
     return db_type, params
 
-
 def choose_db_interactively() -> Tuple[str, dict]:
     db_type = Prompt.ask(
         "Choose DB type",
@@ -74,7 +96,6 @@ def choose_db_interactively() -> Tuple[str, dict]:
         default="sqlite",
     )
     return collect_db_params(db_type)
-
 
 # -----------------------------------------------------------------------------
 # Session state dataclass – keeps connections & objects around
@@ -130,7 +151,6 @@ class Session:
             suggestions = [s for s, _ in fuzz_process.extract(token, candidates, limit=top_k)]
         return suggestions
 
-
 # -----------------------------------------------------------------------------
 # Build session
 # -----------------------------------------------------------------------------
@@ -165,12 +185,14 @@ def build_session(args) -> Optional[Session]:
     table_embs = build_table_embeddings(schema_dict, orchestrator._embed)
     return Session(db_type, extractor, schema_dict, tokenizer, orchestrator, inference, table_embs)
 
-
 # -----------------------------------------------------------------------------
 # REPL with streaming output
 # -----------------------------------------------------------------------------
-
 def repl(session: Session, run_sql: bool):
+    """
+    Temporary logic: Chain of Thought (CoT) is accumulated as all output before the <SQL> token.
+    When the model reliably emits <COT>, change back to logic that collects CoT only between <COT> and </COT>.
+    """
     console.print(Panel("[bold cyan]Transqlate[/bold cyan] – Natural Language → SQL", title="Welcome", expand=False))
     console.print("Type your natural language query or :help for commands.\n")
     while True:
@@ -221,8 +243,8 @@ def repl(session: Session, run_sql: bool):
         with console.status("Processing…", spinner="dots"):
             try:
                 _, prompt_ids, _ = session.orchestrator.build_prompt(line)
-                sch_id = session.tokenizer.special_tokens["<SCHEMA>"]
-                end_id = session.tokenizer.special_tokens["</SCHEMA>"]
+                sch_id = session.tokenizer.get_special_token_id("SCHEMA_START")
+                end_id = session.tokenizer.get_special_token_id("SCHEMA_END")
                 start = prompt_ids.index(sch_id)
                 end = prompt_ids.index(end_id)
                 schema_tokens = prompt_ids[start:end+1]
@@ -249,82 +271,79 @@ def repl(session: Session, run_sql: bool):
                             continue
                 print_exception(e)
                 continue
-        # Streaming CoT & SQL
-        console.print("\n[dim]Chain of Thought:[/dim]")
-        in_cot = False
-        in_sql = False
+        # --- Temporary CoT/SQL segmentation: everything before <SQL> is CoT, after is SQL ---
         cot_text = ""
         sql_text = ""
+        in_sql = False
         for token in stream:
-            if token == FMT_TOK["COT_START"]:
-                in_cot = True
-                continue
-            if token == FMT_TOK["COT_END"]:
-                in_cot = False
-                continue
-            if token == FMT_TOK["SQL_START"]:
-                console.print()  
-                console.print("\n[bold cyan]SQL:[/bold cyan]", end=" ")
+            # print(f"[DEBUG TOKEN] {repr(token)}")  # Uncomment for debugging
+            if token.strip() == FMT_TOK["SQL_START"]:
                 in_sql = True
                 continue
-            if token == FMT_TOK["SQL_END"]:
+            if token.strip() == FMT_TOK["SQL_END"]:
                 break
-            if in_cot:
-                console.print(token, end="", style="dim")
+            if not in_sql:
                 cot_text += token
-            elif in_sql:
-                console.print(token, end="", style="bold cyan")
+            else:
                 sql_text += token
-        console.print()  
-        session.history.append((line, sql_text))
-        if run_sql:
-            session.execute_sql(sql_text)
-
+        cot_text = cot_text.rstrip()
+        if cot_text.endswith(FMT_TOK["COT_END"]):
+            cot_text = cot_text[: -len(FMT_TOK["COT_END"])].rstrip()
+        console.print("\n[dim]Chain of Thought:[/dim]")
+        console.print(cot_text, style="dim", soft_wrap=True)
+        if sql_text.strip():
+            console.print("\n[bold cyan]SQL:[/bold cyan]", soft_wrap=True)
+            console.print(sql_text, style="bold cyan", soft_wrap=True)
+        session.history.append((line, sql_text.strip()))
+        if run_sql and sql_text.strip():
+            session.execute_sql(sql_text.strip())
 
 # -----------------------------------------------------------------------------
 # One-shot mode with streaming
 # -----------------------------------------------------------------------------
-
 def oneshot(session: Session, question: str, execute: bool):
+    """
+    Temporary logic: Chain of Thought (CoT) is accumulated as all output before the <SQL> token.
+    When the model reliably emits <COT>, change back to logic that collects CoT only between <COT> and </COT>.
+    """
     line = question
     _, prompt_ids, _ = session.orchestrator.build_prompt(line)
-    sch_id = session.tokenizer.special_tokens["<SCHEMA>"]
-    end_id = session.tokenizer.special_tokens["</SCHEMA>"]
+    sch_id = session.tokenizer.special_tokens["SCHEMA_START"]
+    end_id = session.tokenizer.special_tokens["SCHEMA_END"]
     start = prompt_ids.index(sch_id)
     end = prompt_ids.index(end_id)
     schema_tokens = prompt_ids[start:end+1]
     console.print(Panel(f"[bold green]Query:[/bold green] {line}"))
     with console.status("Processing…", spinner="dots"):
         stream = session.inference.infer_stream(line, schema_tokens)
-    console.print("\n[dim]Chain of Thought:[/dim]")
-    in_cot = False
-    in_sql = False
     cot_text = ""
     sql_text = ""
+    in_sql = False
     for token in stream:
-        if token == FMT_TOK["COT_START"]:
-            in_cot = True
-            continue
-        if token == FMT_TOK["COT_END"]:
-            in_cot = False
-            continue
-        if token == FMT_TOK["SQL_START"]:
-            console.print()  
-            console.print("\n[bold cyan]SQL:[/bold cyan]", end=" ")
+        # print(f"[DEBUG TOKEN] {repr(token)}")  # Uncomment for debugging
+        if token.strip() == FMT_TOK["SQL_START"]:
             in_sql = True
             continue
-        if token == FMT_TOK["SQL_END"]:
+        if token.strip() == FMT_TOK["SQL_END"]:
             break
-        if in_cot:
-            console.print(token, end="", style="dim")
+        if not in_sql:
             cot_text += token
-        elif in_sql:
-            console.print(token, end="", style="bold cyan")
+        else:
             sql_text += token
-    console.print()  
-    if execute:
-        session.execute_sql(sql_text)
+    cot_text = cot_text.rstrip()
+    if cot_text.endswith(FMT_TOK["COT_END"]):
+        cot_text = cot_text[: -len(FMT_TOK["COT_END"])].rstrip()
+    console.print("\n[dim]Chain of Thought:[/dim]")
+    console.print(cot_text, style="dim", soft_wrap=True)
+    if sql_text.strip():
+        console.print("\n[bold cyan]SQL:[/bold cyan]", soft_wrap=True)
+        console.print(sql_text, style="bold cyan", soft_wrap=True)
+    if execute and sql_text.strip():
+        session.execute_sql(sql_text.strip())
 
+# -----------------------------------------------------------------------------
+# Main entrypoint
+# -----------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser("transqlate – Natural Language to SQL CLI")

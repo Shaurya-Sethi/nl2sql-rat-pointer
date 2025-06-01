@@ -96,7 +96,7 @@ class NL2SQLInference:
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model checkpoint not found at: {model_path}")
-        state = torch.load(model_path, map_location=self.device)
+        state = torch.load(model_path, map_location=self.device, weights_only=False)
         # Support both Trainer checkpoints and plain state_dicts
         if isinstance(state, dict) and 'model_state_dict' in state:
             self.model.load_state_dict(state['model_state_dict'], strict=False)
@@ -128,29 +128,34 @@ class NL2SQLInference:
             )
 
         # 3. Prepare model inputs (tensors)
-        encoder_input_ids = torch.tensor(encoder_input_ids_list, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, L)
-        encoder_attention_mask = (encoder_input_ids != self.config.pad_token_id) # True for non-pad
-        
-        relation_matrix = torch.zeros((1, input_len, input_len), dtype=torch.long, device=self.device)
-        if self.relation_builder is not None:
-            relation_matrix = self.relation_builder.build_relation_matrix(encoder_input_ids_list).unsqueeze(0)
+        encoder_input_ids = torch.tensor(encoder_input_ids_list, dtype=torch.long).unsqueeze(0).to(self.device)
+        encoder_attention_mask = (encoder_input_ids != self.config.pad_token_id).to(self.device)  # True for non-pad
 
+        relation_matrix = self.relation_builder.build_relation_matrix(encoder_input_ids_list)
+        relation_matrix = relation_matrix.to(self.device)
+        relation_matrix = relation_matrix.unsqueeze(0)  # (1, L, L)
+
+        # Build schema_mask for pointer-generator
         schema_mask = None
         if self.config.use_pointer_generator:
             schema_mask = torch.zeros((1, input_len), dtype=torch.bool, device=self.device)
             try:
-                schema_start_idx = encoder_input_ids_list.index(self.tokenizer.get_special_token_id("SCHEMA_START"))
-                schema_end_idx = encoder_input_ids_list.index(self.tokenizer.get_special_token_id("SCHEMA_END"))
+                schema_start_id = self.tokenizer.get_special_token_id("SCHEMA_START")
+                schema_end_id = self.tokenizer.get_special_token_id("SCHEMA_END")
+                schema_start_idx = encoder_input_ids_list.index(schema_start_id)
+                schema_end_idx = encoder_input_ids_list.index(schema_end_id)
                 if schema_end_idx > schema_start_idx:
                     schema_mask[0, schema_start_idx:schema_end_idx+1] = True
             except ValueError:
-                pass # If schema tags not found, leave mask as all False
+                # If schema tags not found, leave mask as all False
+                pass
 
+        # Return all model inputs, all on self.device
         return {
             "encoder_input_ids": encoder_input_ids,
             "encoder_attention_mask": encoder_attention_mask,
             "relation_matrix": relation_matrix,
-            "schema_mask": schema_mask
+            "schema_mask": schema_mask,
         }
 
     def infer(
@@ -194,6 +199,15 @@ class NL2SQLInference:
         """
         Extract CoT and SQL segments from generated token IDs.
         """
+        # TEMP DEBUG STATEMENTS
+        # print("DEBUG: output_ids =", output_ids)
+        # print("DEBUG: SQL_START token ID:", self.tokenizer.get_special_token_id("SQL_START"))
+        # print("DEBUG: SQL_END token ID:", self.tokenizer.get_special_token_id("SQL_END"))
+        # print("DEBUG: Decoded full output:", self.tokenizer.decode(output_ids, skip_special_tokens=False))
+        # print("DEBUG: COT_START token ID:", self.tokenizer.get_special_token_id("COT_START"))
+        # print("DEBUG: COT_END token ID:", self.tokenizer.get_special_token_id("COT_END"))
+
+
         # Map token IDs to text
         id2tok = {v: k for k, v in self.tokenizer.special_token_ids.items()}
         # Find segment indices

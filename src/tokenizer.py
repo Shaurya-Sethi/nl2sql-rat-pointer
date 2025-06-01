@@ -1,3 +1,6 @@
+# All imports in this file should be absolute, relative to src/ root if needed.
+# Do not use sys.path hacks or relative imports.
+
 import os
 import logging
 import threading
@@ -133,4 +136,4 @@ class NL2SQLTokenizer:
         import json
         with open(f"{path}/special_tokens.json", 'r') as f:
             special_tokens = json.load(f)
-        return cls(f"{path}/sp.model", special_tokens) 
+        return cls(f"{path}/sp.model", special_tokens)

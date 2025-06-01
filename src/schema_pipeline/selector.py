@@ -21,7 +21,7 @@ from typing import Dict, List
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from graph import COLUMN_PREFIX
+from schema_pipeline.graph import COLUMN_PREFIX
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())

@@ -1,3 +1,6 @@
+# All imports in this file should be absolute, relative to src/ root if needed.
+# Do not use sys.path hacks or relative imports.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +9,8 @@ from typing import Optional, Tuple, Dict, Any, Union, Iterator
 from encoder import RelationAwareEncoder
 from decoder import TransformerDecoder
 from decoder_pg import PointerGeneratorDecoder
+
+DEBUG_LOGS = False  # Set True for debug/training logs, False for clean inference
 
 class NL2SQLTransformer(nn.Module):
     """
@@ -38,9 +43,9 @@ class NL2SQLTransformer(nn.Module):
         self.sql_end_token_id = sql_end_token_id
         
         # Validate required token IDs for generation if not provided (can be made stricter)
-        if self.cot_start_token_id is None:
+        if self.cot_start_token_id is None and DEBUG_LOGS:
             print("Warning: cot_start_token_id not provided to NL2SQLTransformer. Generation might start with a default token.")
-        if self.sql_end_token_id is None:
+        if self.sql_end_token_id is None and DEBUG_LOGS:
             print("Warning: sql_end_token_id not provided to NL2SQLTransformer. Generation might not stop correctly.")
         
         # Initialize encoder
@@ -281,7 +286,7 @@ class NL2SQLTransformer(nn.Module):
             tgt_key_padding = (decoder_input == self.pad_token_id)
 
             if self.use_pointer_generator:
-                if schema_mask is None:
+                if schema_mask is None and DEBUG_LOGS:
                     print("Warning: schema_mask is None during generation with pointer-generator. Pointer may not target schema tokens correctly.")
                     # Default to a non-schema mask if None, but this might be suboptimal
                     src_mask = torch.zeros_like(encoder_input_ids, dtype=torch.bool, device=device)

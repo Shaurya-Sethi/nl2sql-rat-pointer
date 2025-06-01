@@ -7,9 +7,9 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Tuple
 
-import formatter
-from graph import build_schema_graph
-from selector import build_table_embeddings, select_tables
+from schema_pipeline import formatter
+from schema_pipeline.graph import build_schema_graph
+from schema_pipeline.selector import build_table_embeddings, select_tables
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
