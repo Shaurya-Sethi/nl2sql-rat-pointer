@@ -1,13 +1,22 @@
 # NL2SQL Model Training
 
+> **Note:** All Python imports in this project use absolute imports relative to the `src/` directory. Scripts and modules should be run with `src/` as the working directory or as the Python path root. For example:
+>
+> ```powershell
+> cd src
+> python cli/cli.py ...
+> ```
+>
+> If you encounter `ImportError`, ensure your working directory is `src/`.
+
 This repository contains code for training a natural language to SQL (NL2SQL) transformer model with comprehensive TensorBoard logging.
 
 ## Setup and Installation
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/nl2sql-model.git
-   cd nl2sql-model
+   git clone https://github.com/Shaurya-Sethi/Transqlate.git
+   cd Transqlate
    ```
 
 2. Install dependencies:

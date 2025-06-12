@@ -1,11 +1,16 @@
+# All imports in this file should be absolute, relative to src/ root if needed.
+# Do not use sys.path hacks or relative imports.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Union, Iterator
 
 from encoder import RelationAwareEncoder
 from decoder import TransformerDecoder
 from decoder_pg import PointerGeneratorDecoder
+
+DEBUG_LOGS = False  # Set True for debug/training logs, False for clean inference
 
 class NL2SQLTransformer(nn.Module):
     """
@@ -21,15 +26,27 @@ class NL2SQLTransformer(nn.Module):
         max_len (int): Maximum sequence length
         use_pointer_generator (bool): Whether to use the pointer-generator decoder
         pad_token_id (int): Pad token ID
+        cot_start_token_id (Optional[int]): COT start token ID
+        sql_end_token_id (Optional[int]): SQL end token ID
     """
     def __init__(self, vocab_size: int, num_relations: int, d_model: int = 768, 
                  n_heads: int = 12, n_layers: int = 12, dropout: float = 0.1, 
                  max_len: int = 2048, use_pointer_generator: bool = False,
-                 pad_token_id: int = 18):
+                 pad_token_id: int = 18,
+                 cot_start_token_id: Optional[int] = None, 
+                 sql_end_token_id: Optional[int] = None):
         super().__init__()
         self.vocab_size = vocab_size
         self.use_pointer_generator = use_pointer_generator
         self.pad_token_id = pad_token_id
+        self.cot_start_token_id = cot_start_token_id
+        self.sql_end_token_id = sql_end_token_id
+        
+        # Validate required token IDs for generation if not provided (can be made stricter)
+        if self.cot_start_token_id is None and DEBUG_LOGS:
+            print("Warning: cot_start_token_id not provided to NL2SQLTransformer. Generation might start with a default token.")
+        if self.sql_end_token_id is None and DEBUG_LOGS:
+            print("Warning: sql_end_token_id not provided to NL2SQLTransformer. Generation might not stop correctly.")
         
         # Initialize encoder
         self.encoder = RelationAwareEncoder(
@@ -201,10 +218,14 @@ class NL2SQLTransformer(nn.Module):
                 'encoder_output': encoder_output
             }
         
-    def generate(self, encoder_input_ids: torch.Tensor, encoder_relation_ids: torch.Tensor,
-                max_length: int = 512, num_beams: int = 4,
-                encoder_attention_mask: Optional[torch.Tensor] = None,
-                schema_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def generate(self,
+                 encoder_input_ids: torch.Tensor,
+                 encoder_relation_ids: torch.Tensor,
+                 max_length: int = 1024,
+                 encoder_attention_mask: Optional[torch.Tensor] = None,
+                 schema_mask: Optional[torch.Tensor] = None,
+                 stream: bool = False
+                 ) -> Union[torch.Tensor, Iterator[torch.Tensor]]:
         """
         Generate SQL query from natural language input using greedy decoding.
         
@@ -212,18 +233,21 @@ class NL2SQLTransformer(nn.Module):
             encoder_input_ids: Input token IDs for encoder (batch_size, seq_len)
             encoder_relation_ids: Relation IDs between encoder tokens (batch_size, seq_len, seq_len)
             max_length: Maximum length of generated sequence
-            num_beams: Number of beams for beam search (not used in this implementation yet)
             encoder_attention_mask: Optional. If 2D (batch_size, seq_len), it's a padding mask (True for non-padded tokens).
                                       If 3D (batch_size, seq_len, seq_len), it's a self-attention mask.
             schema_mask: Boolean mask indicating schema tokens (batch_size, seq_len)
+            stream: If True, yields each generated token ID as soon as it's produced
             
         Returns:
-            Generated token IDs (batch_size, max_length)
+            If stream is False:
+                Generated token IDs (batch_size, max_length)
+            If stream is True:
+                Yields each generated token ID tensor (batch_size, 1) one by one
         """
         # Validate input
         batch_size, L_enc = encoder_input_ids.shape
         device = encoder_input_ids.device
-        
+
         # Process encoder_attention_mask for encoder self-attention
         encoder_self_attn_mask_for_encoder_layers = None
         if encoder_attention_mask is not None:
@@ -235,61 +259,66 @@ class NL2SQLTransformer(nn.Module):
                 raise ValueError(
                     f"encoder_attention_mask has unexpected dimensions: {encoder_attention_mask.shape}"
                 )
-        
+
         # Encode input once
         encoder_output = self.encoder(
             input_ids=encoder_input_ids,
             relation_ids=encoder_relation_ids,
             attention_mask=encoder_self_attn_mask_for_encoder_layers
         )
-        
-        # Initialize decoder input with BOS token (assuming pad_token_id + 1, modify if using a different BOS token)
-        # For actual implementation, this should be replaced with the correct BOS token ID
-        bos_token_id = self.pad_token_id + 1  # This is a guess - adjust based on your tokenizer
-        decoder_input = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
-        
-        # Memory key padding mask for cross attention in decoder
+
+        # Initialize decoder input with COT_START token ID
+        if self.cot_start_token_id is None:
+            raise ValueError("cot_start_token_id must be provided for generation.")
+        else:
+            start_token_id = self.cot_start_token_id
+        decoder_input = torch.full((batch_size, 1), start_token_id,
+                                   dtype=torch.long, device=device)
         memory_key_padding_mask = (encoder_input_ids == self.pad_token_id)
-        
-        # Generation loop
-        for i in range(max_length - 1):
-            # Create causal mask for decoder
+
+        # Greedy decode, streaming if requested
+        for _ in range(max_length - 1):
             seq_len = decoder_input.size(1)
             causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device),
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
                 diagonal=1
-            ).bool()
-            
-            # Forward pass through model
+            )
+            tgt_key_padding = (decoder_input == self.pad_token_id)
+
             if self.use_pointer_generator:
-                outputs = self.decoder(
+                if schema_mask is None and DEBUG_LOGS:
+                    print("Warning: schema_mask is None during generation with pointer-generator. Pointer may not target schema tokens correctly.")
+                    # Default to a non-schema mask if None, but this might be suboptimal
+                    src_mask = torch.zeros_like(encoder_input_ids, dtype=torch.bool, device=device)
+                else:
+                    src_mask = schema_mask
+                out = self.decoder(
                     tgt_ids=decoder_input,
                     src_ids=encoder_input_ids,
                     memory=encoder_output,
-                    schema_mask=schema_mask,
+                    schema_mask=src_mask,
                     tgt_mask=causal_mask,
+                    tgt_key_padding_mask=tgt_key_padding,
                     memory_key_padding_mask=memory_key_padding_mask
                 )
-                # Get next token (greedy)
-                next_token = outputs[:, -1:, :].argmax(dim=-1)
+                logits = out[:, -1:, :]
             else:
-                # Standard decoder needs tgt_key_padding_mask for its self-attention if inputs are padded,
-                # and memory_key_padding_mask for cross-attention.
-                current_tgt_key_padding_mask = (decoder_input == self.pad_token_id)
-                outputs = self.decoder(
+                out = self.decoder(
                     tgt_ids=decoder_input,
                     encoder_out=encoder_output,
-                    tgt_mask=causal_mask, # Causal mask for self-attention
-                    tgt_key_padding_mask=current_tgt_key_padding_mask, # Padding for current decoder input
-                    memory_key_padding_mask=memory_key_padding_mask # Padding for encoder output in cross-attention
+                    tgt_mask=causal_mask,
+                    tgt_key_padding_mask=tgt_key_padding,
+                    memory_key_padding_mask=memory_key_padding_mask
                 )
-                # Get next token (greedy)
-                next_token = outputs[:, -1:, :].argmax(dim=-1)
-            
-            # Append next token to decoder input
+                logits = out[:, -1:, :]
+
+            next_token = logits.argmax(dim=-1)  # (batch_size, 1)
             decoder_input = torch.cat([decoder_input, next_token], dim=1)
-            
-            # Stop if all sequences have generated EOS token (you might need to define this)
-            # For now, we'll just generate the full length
-        
-        return decoder_input
+
+            if stream:
+                yield next_token  # yield the raw token ID tensor
+            if self.sql_end_token_id is not None and (next_token == self.sql_end_token_id).all():
+                break
+
+        if not stream:
+            return decoder_input

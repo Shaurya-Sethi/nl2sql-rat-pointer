@@ -20,6 +20,7 @@ import signal  # Added for signal handling
 import glob # For finding latest checkpoint
 import re # For parsing checkpoint filenames
 from typing import Optional
+from datetime import datetime # Added for unique SFT directory naming
 
 # Set up logging
 logging.basicConfig(
@@ -39,6 +40,10 @@ def handle_signal(signum, frame):
     sig_name = signal.Signals(signum).name
     logger.info(f"{sig_name} received, flagging for graceful shutdown. Training will attempt to save a checkpoint and exit after the current step/batch.")
     training_interrupted = True
+    if global_trainer: # Attempt to tell trainer to stop, if possible
+        logger.info("Informing trainer about the interruption.")
+        # This is a conceptual addition; actual interruption mechanism inside Trainer would be complex.
+        # For now, the flag `training_interrupted` is the primary mechanism checked in the main loop.
 
 # Worker init function for DataLoader
 def worker_init_fn(worker_id):
@@ -126,14 +131,77 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     # Load NL2SQLConfig object
+    original_config_path = args.config
     try:
-        model_config = NL2SQLConfig.from_yaml(args.config, args.phase)
+        model_config = NL2SQLConfig.from_yaml(original_config_path, args.phase)
     except FileNotFoundError:
         logger.error(f"Configuration file not found at {args.config}")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error loading or parsing configuration: {e}")
         sys.exit(1)
+
+    # Determine and set output directory
+    with open(original_config_path, 'r') as f_raw_yaml:
+        raw_config_yaml = yaml.safe_load(f_raw_yaml)
+    base_output_dir_from_yaml = raw_config_yaml.get('paths', {}).get('output_dir', 'outputs')
+
+    checkpoint_to_load = None # Path to the checkpoint for full trainer state resume
+    initialize_from_pretrained = None # Path to checkpoint for model weight initialization only
+
+    if args.phase == 'sft':
+        if args.resume_from_checkpoint and os.path.isfile(args.resume_from_checkpoint):
+            # Case 1: Explicitly resuming an SFT run from a specific SFT checkpoint.
+            logger.info(f"SFT: Attempting to explicitly resume from SFT checkpoint: {args.resume_from_checkpoint}")
+            model_config.output_dir = str(Path(args.resume_from_checkpoint).parent)
+            checkpoint_to_load = args.resume_from_checkpoint
+            logger.info(f"SFT: Output directory set to SFT checkpoint's parent: {model_config.output_dir}")
+        elif args.pretrained_model:
+            # Case 2: Starting a NEW SFT run, using --pretrained_model for initial weights.
+            logger.info(f"SFT: Starting new SFT run. Initializing model weights from --pretrained_model: {args.pretrained_model}")
+            sft_run_name = f"sft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            model_config.output_dir = os.path.join(base_output_dir_from_yaml, sft_run_name)
+            initialize_from_pretrained = args.pretrained_model
+            logger.info(f"SFT: New SFT output directory created: {model_config.output_dir}")
+            # Trainer state will be reset later if this path is taken.
+        else:
+            # Case 3: Implicit SFT resume (from model_config.output_dir if it's a valid SFT dir) OR SFT from scratch.
+            # model_config.output_dir is currently from YAML (e.g., "outputs/").
+            logger.info(f"SFT: No explicit resume or --pretrained_model. Checking for auto-resume in: {model_config.output_dir}")
+            potential_latest_ckpt = Path(model_config.output_dir) / 'latest_checkpoint.pt'
+            most_recent_step_ckpt = find_most_recent_checkpoint(model_config.output_dir)
+
+            # Heuristic: if output_dir is the generic base_output_dir_from_yaml (e.g. "outputs")
+            # and it contains checkpoints, these are likely pretraining. Don't auto-resume SFT state from them.
+            # Only auto-resume if model_config.output_dir is *not* the generic base and contains checkpoints.
+            is_generic_output_dir = (Path(model_config.output_dir).resolve() == Path(base_output_dir_from_yaml).resolve())
+
+            if not is_generic_output_dir and (potential_latest_ckpt.is_file() or most_recent_step_ckpt):
+                if potential_latest_ckpt.is_file():
+                    logger.info(f"SFT: Found latest_checkpoint.pt in specific SFT directory {model_config.output_dir}. Attempting auto-resume.")
+                    checkpoint_to_load = str(potential_latest_ckpt)
+                elif most_recent_step_ckpt:
+                    logger.info(f"SFT: Found step-based checkpoint {most_recent_step_ckpt} in specific SFT directory {model_config.output_dir}. Attempting auto-resume.")
+                    checkpoint_to_load = most_recent_step_ckpt
+                # model_config.output_dir is already set to the SFT directory.
+            else:
+                if is_generic_output_dir and (potential_latest_ckpt.is_file() or most_recent_step_ckpt):
+                    logger.info(f"SFT: Checkpoints found in generic output directory '{model_config.output_dir}'. These are assumed to be pretraining. "
+                                f"To start SFT from these, use --pretrained_model. Starting SFT from scratch or requiring explicit SFT resume.")
+                
+                logger.info(f"SFT: No resumable SFT checkpoint found in {model_config.output_dir} (or it's a generic dir with pretrain checkpoints). Starting SFT from scratch.")
+                sft_run_name = f"sft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                model_config.output_dir = os.path.join(base_output_dir_from_yaml, sft_run_name)
+                logger.info(f"SFT: New SFT output directory for 'from scratch' run: {model_config.output_dir}")
+                # checkpoint_to_load remains None. Trainer state is fresh.
+    else: # Pretrain phase
+        # Pretrain always uses the output_dir from config or a default like "outputs/pretrain_..."
+        # For simplicity, pretrain output logic can be less complex or use a fixed subfolder if needed.
+        # Current logic: model_config.output_dir is used as is from YAML for pretrain.
+        logger.info(f"Pretrain phase. Output directory: {model_config.output_dir}")
+
+    Path(model_config.output_dir).mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory for this run: {model_config.output_dir}")
 
     # Handle pointer_generator for pretraining phase
     if args.phase == 'pretrain' and model_config.use_pointer_generator:
@@ -153,31 +221,19 @@ def main():
     )
 
     # Initialize model
-    if args.phase == 'sft' and args.pretrained_model:
-        logger.info(f"Loading pretrained model checkpoint from {args.pretrained_model} for SFT.")
-        model = NL2SQLTransformer(
-            vocab_size=model_config.vocab_size,
-            d_model=model_config.d_model,
-            n_heads=model_config.n_heads,
-            n_layers=model_config.n_layers,
-            num_relations=model_config.num_relations,
-            dropout=model_config.dropout,
-            max_len=model_config.max_len,
-            use_pointer_generator=model_config.use_pointer_generator,
-            pad_token_id=model_config.pad_token_id
-        )
-    else:
-        model = NL2SQLTransformer(
-            vocab_size=model_config.vocab_size,
-            d_model=model_config.d_model,
-            n_heads=model_config.n_heads,
-            n_layers=model_config.n_layers,
-            num_relations=model_config.num_relations,
-            dropout=model_config.dropout,
-            max_len=model_config.max_len,
-            use_pointer_generator=model_config.use_pointer_generator,
-            pad_token_id=model_config.pad_token_id
-        )
+    model = NL2SQLTransformer(
+        vocab_size=model_config.vocab_size,
+        d_model=model_config.d_model,
+        n_heads=model_config.n_heads,
+        n_layers=model_config.n_layers,
+        num_relations=model_config.num_relations,
+        dropout=model_config.dropout,
+        max_len=model_config.max_len,
+        use_pointer_generator=model_config.use_pointer_generator,
+        pad_token_id=model_config.pad_token_id,
+        cot_start_token_id=tokenizer.get_special_token_id('COT_START'),
+        sql_end_token_id=tokenizer.get_special_token_id('SQL_END')
+    )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -244,17 +300,87 @@ def main():
     )
     global_trainer = trainer  # Set the global trainer for signal handlers
 
-    if args.phase == 'sft' and args.pretrained_model:
+    # Checkpoint loading / Resumption logic
+    if checkpoint_to_load: # This implies resuming a full SFT state or pretrain state
         try:
-            trainer.load_checkpoint(args.pretrained_model)
-            logger.info(f"Successfully loaded weights from checkpoint: {args.pretrained_model}")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint {args.pretrained_model}: {e}. Starting SFT from scratch.")
+            trainer.load_checkpoint(checkpoint_to_load) # This loads full state: model, optimizer, scheduler, epoch, step, best_val_loss
+            logger.info(f"Successfully resumed training state using checkpoint: {checkpoint_to_load}")
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+            config_lr = model_config.learning_rate
+            logger.info(f"Learning Rate Check - Config: {config_lr}, Current: {current_lr}")
+            if current_lr != config_lr:
+                logger.warning(f"Learning rate from checkpoint ({current_lr}) differs from config ({config_lr})")
+                if args.phase == 'sft': # For SFT, we typically want to enforce the SFT LR from config on resume
+                    logger.info("SFT Phase: Updating learning rate to match SFT config.")
+                    for param_group in trainer.optimizer.param_groups:
+                        param_group['lr'] = config_lr
+                    # Re-initialize scheduler with the correct SFT LR and current step if SFT
+                    # trainer.scheduler might be None if loaded from an old checkpoint or different setup
+                    trainer.scheduler = get_cosine_schedule_with_warmup(
+                        trainer.optimizer,
+                        num_warmup_steps=model_config.warmup_steps,
+                        num_training_steps=model_config.max_steps
+                    )
+                    # Fast-forward scheduler to the current global_step loaded from checkpoint
+                    for _ in range(trainer.global_step):
+                        trainer.scheduler.step()
+                    logger.info(f"SFT Phase: Scheduler re-initialized and fast-forwarded to global_step: {trainer.global_step}")
+                else:
+                    logger.info("Pretrain Phase: Using learning rate from checkpoint.")
 
-    # Register signal handlers
-    logger.info("Registering signal handlers for graceful shutdown")
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint {checkpoint_to_load}: {e}. Training will start from scratch or from --pretrained_model if SFT.", exc_info=True)
+            # Reset trainer state as checkpoint loading failed
+            trainer.epoch = 0
+            trainer.global_step = 0
+            trainer.best_val_loss = float('inf')
+            trainer.no_improve_epochs = 0
+            if trainer.optimizer is None: raise ValueError("Trainer optimizer is None after failed checkpoint load attempt.")
+            trainer.scheduler = get_cosine_schedule_with_warmup(
+                trainer.optimizer,
+                num_warmup_steps=model_config.warmup_steps,
+                num_training_steps=model_config.max_steps
+            )
+            logger.info("Reinitialized scheduler after failed checkpoint load.")
+            checkpoint_to_load = None # Ensure we don't think we loaded something
+
+    # This block is specifically for initializing SFT from a --pretrained_model (e.g. pretrain checkpoint)
+    # It runs if checkpoint_to_load was NOT set by SFT resume logic AND initialize_from_pretrained IS set.
+    if args.phase == 'sft' and initialize_from_pretrained and not checkpoint_to_load:
+        try:
+            logger.info(f"SFT: Initializing model weights from --pretrained_model: {initialize_from_pretrained} for a NEW SFT run.")
+            sft_initial_checkpoint = torch.load(initialize_from_pretrained, map_location=device)
+            if 'model_state_dict' in sft_initial_checkpoint:
+                missing_keys, unexpected_keys = model.load_state_dict(sft_initial_checkpoint['model_state_dict'], strict=False)
+                if missing_keys: logger.warning(f"SFT init from --pretrained_model: missing keys: {missing_keys}")
+                if unexpected_keys: logger.warning(f"SFT init from --pretrained_model: unexpected keys: {unexpected_keys}")
+                logger.info(f"SFT: Successfully loaded model weights from --pretrained_model: {initialize_from_pretrained}")
+
+                logger.info("SFT: Resetting trainer state (epoch, step, loss, scheduler) for new SFT run from pretrained model.")
+                trainer.epoch = 0
+                trainer.global_step = 0
+                trainer.best_val_loss = float('inf')
+                trainer.no_improve_epochs = 0
+                
+                if trainer.optimizer is None: raise ValueError("SFT: Trainer optimizer is None before SFT scheduler re-init.")
+                trainer.scheduler = get_cosine_schedule_with_warmup(
+                    trainer.optimizer,
+                    num_warmup_steps=model_config.warmup_steps, # SFT warmup
+                    num_training_steps=model_config.max_steps  # SFT max_steps
+                )
+                logger.info("SFT: Scheduler re-initialized for new SFT phase.")
+            else:
+                logger.warning(f"SFT: --pretrained_model ({initialize_from_pretrained}) lacks 'model_state_dict'. SFT starting from scratch.")
+        except Exception as e:
+            logger.error(f"SFT: Failed to load --pretrained_model {initialize_from_pretrained}: {e}. SFT starting from scratch.", exc_info=True)
+    
+    elif not checkpoint_to_load and not (args.phase == 'sft' and initialize_from_pretrained) :
+        logger.info(f"Starting {args.phase} training from scratch (no checkpoint resumed, no --pretrained_model for SFT weights)." )
+
+    # Ensure BnB optimizer state is initialized robustly, especially after checkpoint load or model manipulation
+    if model_config.use_8bit_optimizer and hasattr(trainer.optimizer, '_init_group'):
+        logger.info("Performing initial robust check and initialization of bitsandbytes optimizer state before training loop...")
+        trainer._ensure_bnb_state(trainer.optimizer)
 
     logger.info(f"Starting {args.phase} training for {model_config.max_steps} steps...")
     steps_per_epoch = len(train_loader) // model_config.gradient_accumulation_steps
@@ -264,94 +390,6 @@ def main():
     logger.info(f"Calculated num_epochs based on max_steps: {num_epochs_for_max_steps}")
     logger.info(f"Target total epochs for this run: {model_config.epochs}") # New log for total epochs
     
-    # Checkpoint loading / Resumption logic
-    checkpoint_to_load = None
-    if args.resume_from_checkpoint:
-        if os.path.isfile(args.resume_from_checkpoint):
-            checkpoint_to_load = args.resume_from_checkpoint
-            logger.info(f"Attempting to resume from specified checkpoint: {checkpoint_to_load}")
-        else:
-            logger.warning(f"Specified resume_from_checkpoint not found: {args.resume_from_checkpoint}. Will check for latest_checkpoint.pt or other checkpoints.")
-
-    if not checkpoint_to_load:
-        latest_checkpoint_path = Path(model_config.output_dir) / 'latest_checkpoint.pt'
-        if latest_checkpoint_path.is_file():
-            checkpoint_to_load = str(latest_checkpoint_path)
-            logger.info(f"Found latest_checkpoint.pt. Attempting to resume from: {checkpoint_to_load}")
-        else:
-            logger.info(f"No latest_checkpoint.pt found in {model_config.output_dir}. Scanning for most recent step-based checkpoint...")
-            # Call the new helper function to find the most recent checkpoint by step number
-            most_recent_ckpt_path = find_most_recent_checkpoint(model_config.output_dir)
-            if most_recent_ckpt_path:
-                checkpoint_to_load = most_recent_ckpt_path
-                # Log will be done by find_most_recent_checkpoint for which one it selected
-            else:
-                logger.info(f"No other resume-suitable checkpoints (e.g., checkpoint_epoch*_step*.pt or checkpoint-*.pt) found in {model_config.output_dir}.")
-
-    if checkpoint_to_load:
-        try:
-            trainer.load_checkpoint(checkpoint_to_load)
-            logger.info(f"Successfully resumed training state using checkpoint: {checkpoint_to_load}")
-            # Add these debug lines
-            current_lr = trainer.optimizer.param_groups[0]['lr']
-            config_lr = model_config.learning_rate
-            logger.info(f"Learning Rate Check - Config: {config_lr}, Current: {current_lr}")
-            if current_lr != config_lr:
-                logger.warning(f"Learning rate from checkpoint ({current_lr}) differs from config ({config_lr})")
-                # Update the learning rate to match config
-                for param_group in trainer.optimizer.param_groups:
-                    param_group['lr'] = config_lr
-                logger.info(f"Updated learning rate to match config: {config_lr}")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint {checkpoint_to_load}: {e}. Training will start from scratch or from --pretrained_model if SFT.", exc_info=True)
-            trainer.epoch = 0
-            trainer.global_step = 0
-            trainer.best_val_loss = float('inf')
-            trainer.no_improve_epochs = 0 # Reset this as well
-            # Re-initialize scheduler as checkpoint loading might have affected it or its optimizer reference
-            if trainer.optimizer is None: # Should have been created in Trainer.__init__
-                 raise ValueError("Trainer optimizer is None after failed checkpoint load attempt.")
-            trainer.scheduler = get_cosine_schedule_with_warmup(
-                trainer.optimizer,
-                num_warmup_steps=model_config.warmup_steps,
-                num_training_steps=model_config.max_steps
-            )
-            logger.info("Reinitialized scheduler after failed checkpoint load.")
-    elif args.phase == 'sft' and args.pretrained_model:
-        # This case is for starting SFT from a --pretrained_model (e.g. from pretraining phase),
-        # NOT for resuming an SFT run. Resuming SFT is handled by latest_checkpoint.pt or --resume_from_checkpoint.
-        try:
-            # For loading a model from a different phase (e.g., pretrain model for SFT start)
-            # We only load model_state_dict, not optimizer, scheduler, epoch, etc.
-            logger.info(f"No SFT checkpoint to resume. Attempting to load weights from --pretrained_model: {args.pretrained_model} for SFT start.")
-            sft_initial_checkpoint = torch.load(args.pretrained_model, map_location=device)
-            if 'model_state_dict' in sft_initial_checkpoint:
-                # Load with strict=False if vocab size changed or other minor architecture diffs expected
-                # For example, if pretraining had a different output layer for LM task.
-                # However, core transformer blocks should be compatible.
-                missing_keys, unexpected_keys = model.load_state_dict(sft_initial_checkpoint['model_state_dict'], strict=False)
-                if missing_keys:
-                    logger.warning(f"During SFT init from --pretrained_model, some keys were missing in checkpoint: {missing_keys}")
-                if unexpected_keys:
-                    logger.warning(f"During SFT init from --pretrained_model, some keys in checkpoint were unexpected: {unexpected_keys}")
-                logger.info(f"Successfully loaded model weights from --pretrained_model: {args.pretrained_model} for SFT start.")
-            else:
-                logger.warning(f"--pretrained_model specified ({args.pretrained_model}) but it does not contain 'model_state_dict'. Starting SFT from scratch.")
-
-        except Exception as e:
-            logger.error(f"Failed to load --pretrained_model {args.pretrained_model} for SFT: {e}. Starting SFT from scratch.")
-    else:
-        logger.info(f"No checkpoint found to resume from, and not SFT with --pretrained_model. Starting {args.phase} training from scratch.")
-
-    # Ensure BnB optimizer state is initialized robustly, especially after checkpoint load or model manipulation
-    if model_config.use_8bit_optimizer and hasattr(trainer.optimizer, '_init_group'):
-        logger.info("Performing initial robust check and initialization of bitsandbytes optimizer state before training loop...")
-        trainer._ensure_bnb_state(trainer.optimizer)
-
-    logger.info(f"Starting {args.phase} training. Will train for a total of {model_config.epochs} epochs.")
-    logger.info(f"Initial state: Epoch {trainer.epoch}, Global Step {trainer.global_step}, Best Val Loss {trainer.best_val_loss:.4f}")
-    logger.info(f"Max steps for LR scheduler remains: {model_config.max_steps}") # Clarify max_steps is for scheduler
-
     start_epoch = trainer.epoch # Get start_epoch from trainer, which is 0 or loaded from checkpoint
 
     try:
@@ -367,17 +405,24 @@ def main():
             train_metrics = trainer.train_epoch() # This will iterate through train_loader
             logger.info(f"Epoch {trainer.epoch} Training Summary: Train Loss: {train_metrics.get('train_loss', float('nan')):.4f}")
 
-            # ====== CUSTOM LEARNING RATE SCHEDULE ======
-            if current_epoch == 0:
-                new_lr = 1e-4
-            elif current_epoch == 1:
-                new_lr = 3e-5
-            else:
-                new_lr = 1e-6
+            # Save checkpoint after epoch completion, before validation
+            if not training_interrupted: # Only save epoch-end checkpoint if not already interrupted (avoid double save on interrupt)
+                logger.info(f"Saving checkpoint at end of epoch {trainer.epoch} (Global step: {trainer.global_step}) before validation.")
+                trainer.save_checkpoint(is_best=False)
 
-            for param_group in trainer.optimizer.param_groups:
-                param_group['lr'] = new_lr
-            logger.info(f"Set learning rate to {new_lr} at end of epoch {current_epoch}")
+            # ====== CUSTOM LEARNING RATE SCHEDULE ======
+            # This custom schedule is now applied only during pretraining phase.
+            if args.phase == 'pretrain':
+                if current_epoch == 0:
+                    new_lr = 1e-4
+                elif current_epoch == 1:
+                    new_lr = 3e-5
+                else:
+                    new_lr = 1e-6
+
+                for param_group in trainer.optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                logger.info(f"Pretrain Phase: Set learning rate to {new_lr} at end of epoch {current_epoch}")
             # ====== END CUSTOM LR SCHEDULE ======
 
             if training_interrupted:
@@ -406,12 +451,10 @@ def main():
                         break 
             else:
                 logger.info(f"Skipping validation for Epoch {trainer.epoch} as no validation dataloader or eval_file is configured.")
-                # If no validation, save a regular checkpoint periodically based on save_steps (handled by global_step check later)
-                # or after each epoch if save_steps is large.
-                if (trainer.epoch +1) % model_config.save_steps == 0 : # Fallback save if no validation
-                     logger.info(f"No validation, saving checkpoint after epoch {trainer.epoch} due to save_steps configuration.")
-                     trainer.save_checkpoint(is_best=False)
-
+                # If no validation, regular checkpoint saving is now primarily handled by:
+                # 1. Step-based saving within trainer.train_epoch().
+                # 2. The epoch-end save that occurs just before this validation block (if validation were enabled).
+                # No additional save is needed here.
 
             if training_interrupted:
                 logger.info("Training interrupted after validation/early stopping. Saving checkpoint and exiting.")
@@ -452,10 +495,13 @@ def main():
             logger.info("Attempting to save final checkpoint...")
             trainer.save_checkpoint(is_best=False) # Save a final checkpoint regardless of why we exited
 
-            # Save final model state dict separately
-            final_model_dir = Path(model_config.output_dir) / args.phase
-            final_model_dir.mkdir(parents=True, exist_ok=True)
-            final_model_path = final_model_dir / f'final_model_state_dict_epoch{trainer.epoch}_step{trainer.global_step}.pt'
+            # Save final model state dict separately in the phase-specific subfolder of output_dir
+            # The output_dir in model_config should already be phase-specific (e.g., outputs/sft_xxxx)
+            final_model_phase_dir = Path(model_config.output_dir) # Already phase specific
+            # final_model_phase_dir.mkdir(parents=True, exist_ok=True) # output_dir already created
+            
+            final_model_filename = f'final_model_state_dict_phase_{args.phase}_epoch{trainer.epoch}_step{trainer.global_step}.pt'
+            final_model_path = final_model_phase_dir / final_model_filename
             torch.save(model.state_dict(), final_model_path)
             logger.info(f"Final model state_dict saved to {final_model_path}")
         else:

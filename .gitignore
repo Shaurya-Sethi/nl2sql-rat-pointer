@@ -93,6 +93,7 @@ cython_debug/
 # Others
 project-Transqlate-context.md
 inspect_tokenized_sft_data.py
-inference.py
 example_usage.py
-schema_pipeline/
+tests/
+problem_description.txt
+terminal output.txt

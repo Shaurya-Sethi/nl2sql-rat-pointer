@@ -455,6 +455,11 @@ class Trainer:
                             current_lr = self.optimizer.param_groups[0]['lr']
                             self.writer.add_scalar('training/learning_rate', current_lr, self.global_step)
 
+                        # === Step-based checkpointing ===
+                        if self.config.save_steps > 0 and self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+                            logger.info(f"Saving step-based checkpoint at global_step {self.global_step}")
+                            self.save_checkpoint(is_best=False) # Regular step-based checkpoint
+                            
                         # === Karpathy-style periodic model generation ===
                         if (
                             getattr(self, 'GENERATE_ENABLED', True)

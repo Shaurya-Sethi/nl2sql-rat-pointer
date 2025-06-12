@@ -144,24 +144,26 @@ class RelationMatrixBuilder:
     # ------------------------------------------------------------------
     # Phase 1 – slice out the schema       full_ids  →  schema_ids
     # ------------------------------------------------------------------
-    def _extract_schema_segment(self, full_ids: List[int]) -> List[int]:
-        """Return the sub‑list *between* <SCHEMA> and </SCHEMA>."""
+    def _extract_schema_segment(self, full_ids: List[int]) -> Tuple[List[int], int]:
+        """Return the sub‑list *between* <SCHEMA> and </SCHEMA> and its start offset."""
         try:
             s = full_ids.index(self.tok_id["SCHEMA_START"]) + 1
             e = full_ids.index(self.tok_id["SCHEMA_END"])
         except ValueError:
             logger.error("<SCHEMA> or </SCHEMA> tokens missing – aborting parse")
-            return []
+            return [], 0 # Return 0 offset on error
         if s >= e:
             logger.error("Malformed schema segment – start ≥ end")
-            return []
-        return full_ids[s:e]
+            return [], 0 # Return 0 offset on error
+        # The offset is 's', the index of the first token *within* the schema segment,
+        # relative to full_ids.
+        return full_ids[s:e], s
 
     # ------------------------------------------------------------------
     # Phase 2 – walk schema tokens and materialise SchemaToken objects
     # ------------------------------------------------------------------
     def parse_schema_tokens(self, full_ids: List[int]) -> List[SchemaToken]:
-        schema_ids = self._extract_schema_segment(full_ids)
+        schema_ids, schema_start_offset = self._extract_schema_segment(full_ids)
         if not schema_ids:
             return []
 
@@ -185,8 +187,8 @@ class RelationMatrixBuilder:
                 if self._is_ident(col_name):
                     tokens.append(
                         SchemaToken(
-                            span_start=pk_start,
-                            span_end=pk_end,
+                            span_start=pk_start + schema_start_offset,
+                            span_end=pk_end + schema_start_offset,
                             token_type="pk",
                             table_name=current_table,
                             column_name=col_name,
@@ -213,8 +215,8 @@ class RelationMatrixBuilder:
                 if self._is_ident(col_name):
                     tokens.append(
                         SchemaToken(
-                            span_start=fk_start,
-                            span_end=fk_end,
+                            span_start=fk_start + schema_start_offset,
+                            span_end=fk_end + schema_start_offset,
                             token_type="fk",
                             table_name=current_table,
                             column_name=col_name,
@@ -244,8 +246,8 @@ class RelationMatrixBuilder:
                 table_end = j - 1
                 tokens.append(
                     SchemaToken(
-                        span_start=table_start,
-                        span_end=table_end,
+                        span_start=table_start + schema_start_offset,
+                        span_end=table_end + schema_start_offset,
                         token_type="table",
                         table_name=table_name,
                     )
@@ -267,8 +269,8 @@ class RelationMatrixBuilder:
                 col_name = self._norm(tk_text.split(":", 1)[0])
                 tokens.append(
                     SchemaToken(
-                        span_start=col_start,
-                        span_end=col_end,
+                        span_start=col_start + schema_start_offset,
+                        span_end=col_end + schema_start_offset,
                         token_type="column",
                         table_name=current_table,
                         column_name=col_name,
@@ -296,7 +298,17 @@ class RelationMatrixBuilder:
         seq_len = len(full_ids)
         rel = torch.zeros((seq_len, seq_len), dtype=torch.long)
 
+        # IMPORTANT: The SchemaToken spans (i.k. span_start, i.span_end) are now GLOBAL,
+        # meaning they are relative to the `full_ids` sequence.
+        # This is crucial for correctly placing relations in the matrix when the
+        # schema is preceded by other tokens (e.g., Natural Language).
         def set_span(a: Tuple[int, int], b: Tuple[int, int], rel_id: int):
+            # Ensure spans are within bounds of the full relation matrix
+            # This check is more critical now that spans are global.
+            if not (0 <= a[0] < seq_len and 0 <= a[1] < seq_len and \
+                    0 <= b[0] < seq_len and 0 <= b[1] < seq_len):
+                logger.warning(f"Span out of bounds: a={a}, b={b}, seq_len={seq_len}. Skipping relation.")
+                return
             rel[a[0] : a[1] + 1, b[0] : b[1] + 1] = rel_id
 
         for i in schema_tokens:
