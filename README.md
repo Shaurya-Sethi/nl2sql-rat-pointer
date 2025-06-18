@@ -1,4 +1,4 @@
-# NL2SQL Model Training
+# NL2SQL Model Training (Research Prototype)
 
 > **Note:** All Python imports in this project use absolute imports relative to the `src/` directory. Scripts and modules should be run with `src/` as the working directory or as the Python path root. For example:
 >
@@ -10,6 +10,17 @@
 > If you encounter `ImportError`, ensure your working directory is `src/`.
 
 This repository contains code for training a natural language to SQL (NL2SQL) transformer model with comprehensive TensorBoard logging.
+
+> **Disclaimer**: This project was originally built as a learning exercise and
+> a proof of concept for research on relation-aware attention and
+> pointer-generator mechanisms. The codebase has not been hardened for
+> production use and has only minimal testing. It is provided as a reference for
+> educational and experimental purposes.
+
+This means that certain parts of the training pipeline may be brittle or
+incomplete. There is no formal support or guarantee of backwards compatibility,
+and the repository is maintained mainly for illustrative purposes. Feel free to
+fork it and adapt pieces for your own experiments.
 
 ## Setup and Installation
 
