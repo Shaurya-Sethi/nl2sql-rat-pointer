@@ -26,8 +26,8 @@ fork it and adapt pieces for your own experiments.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/Shaurya-Sethi/Transqlate.git
-   cd Transqlate
+   git clone https://github.com/Shaurya-Sethi/nl2sql-rat-pointer.git
+   cd nl2sql-rat-pointer
    ```
 
 2. Install dependencies:
